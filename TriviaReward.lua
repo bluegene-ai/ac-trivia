@@ -22,12 +22,13 @@
 --    * 管理员指令（GM 等级 >= Config.minGMRankForCommand；控制台 / SOAP 同样可用）:
 --         .trivia start [题号]   立即开始一题（可指定题库下标，便于测试）
 --         .trivia stop           立刻结束当前题目（不发奖励）
---         .trivia pause|off      暂停自动出题（当前题目继续）
---         .trivia resume|on      恢复自动出题
---         .trivia enable|disable 运行时开启/关闭整个系统
+--         .trivia pause|off      暂停自动出题（当前题目继续到结束；已暂停时重复执行无副作用）
+--         .trivia resume|on      恢复自动出题，并把下一题提前到约 Config.resumeDelaySeconds 秒后
+--         .trivia enable|disable 运行时开启/关闭整个系统（下一题提前到场；重启后以库/配置为准）
 --         .trivia reload         重新从数据库读取设置/题库/奖励预设
+--         .trivia schedule       查看定时启停计划（每天的时间段）与下一次开关时间
 --         .trivia api            输出单行 JSON 状态（AGMP 面板用）
---         .trivia status         查看运行状态（题库数、答题频道、剩余时间）
+--         .trivia status         查看运行状态（题库数、答题频道、下一题倒计时、定时计划）
 --         .trivia stats          查看本次开启以来的答对排行
 --         .trivia chanscan       开始/停止频道扫描：把频道发言的频道 ID 打到 ALE 日志并私聊你，
 --                                用来确认"世界频道/综合频道"这类 ID（自定义频道是负数）
@@ -64,6 +65,19 @@ setDefault(C, "remindEverySeconds", 30)         -- 作答期间每隔多少秒�
 setDefault(C, "tickIntervalMs", 1000)           -- 内部定时器间隔（毫秒），一般不用改
 setDefault(C, "minPlayersOnline", 1)            -- 在线人数少于该值时不出题
 setDefault(C, "idleRetrySeconds", 5)            -- 人数不足时，多少秒后重新检查
+setDefault(C, "resumeDelaySeconds", 5)          -- .trivia resume / enable 后多少秒出下一题
+
+-- 定时启停：按"每天的固定时间段"自动开启/结束答题活动（面板「运行状态」页可直接改）
+--   scheduleEnabled = true 时，时间段的优先级高于 .trivia enable / disable：
+--   进入时间段会自动开启，离开时间段会自动结束当前题并停止出题。
+--   scheduleWindows 写法（分号或换行分隔多段；不带星期前缀 = 每天）：
+--       "08:00-09:00"                     每天 8:00-9:00
+--       "08:00-09:00; 20:00-22:00"        每天两段
+--       "1-5@08:00-09:00"                 周一至周五（1=周一 … 7=周日）
+--       "6,7@20:00-21:00"                 周六、周日
+--       "22:00-02:00"                     跨夜（到第二天凌晨 2 点）
+setDefault(C, "scheduleEnabled", false)
+setDefault(C, "scheduleWindows", "")
 
 --==============================================================================
 --  ② 配置：发言频道（从哪里收答案）
@@ -357,6 +371,8 @@ local SETTING_FIELDS = {
     { "item_link_locale",        "itemLinkLocale",         "int" },
     { "mail_subject",            "mailSubject",            "string" },
     { "mail_body",               "mailBody",               "string" },
+    { "schedule_enabled",        "scheduleEnabled",        "bool" },
+    { "schedule_windows",        "scheduleWindows",        "csvtext" },
 }
 
 -- 建表语句（面板靠表结构读写，加列时请同步 AGMP 的 Domain/Trivia 与视图）
@@ -396,6 +412,8 @@ local SCHEMA_SQL = {
         .. "`item_link_locale` INT NOT NULL DEFAULT 4,"
         .. "`mail_subject` VARCHAR(128) NOT NULL DEFAULT '答题奖励',"
         .. "`mail_body` TEXT NULL,"
+        .. "`schedule_enabled` TINYINT NOT NULL DEFAULT 0,"
+        .. "`schedule_windows` VARCHAR(255) NOT NULL DEFAULT '',"
         .. "`updated_at` INT NOT NULL DEFAULT 0,"
         .. "PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;",
     "CREATE TABLE IF NOT EXISTS `%s`.`trivia_reward_questions` ("
@@ -614,6 +632,13 @@ local function sqlValueOf(key, sqlType)
     if sqlType == "csv" then
         return sqlQuote(joinCsv(value))
     end
+    if sqlType == "csvtext" then
+        -- 允许配置文件里写成数组：{ "08:00-09:00", "20:00-21:00" }
+        if type(value) == "table" then
+            value = table.concat(value, ";")
+        end
+        return sqlQuote(tostring(value == nil and "" or value))
+    end
     return sqlQuote(tostring(value == nil and "" or value))
 end
 
@@ -710,6 +735,9 @@ local function ensureSchema()
     -- 老版本表结构补列（面板与模板导入会用到 source/created_at）
     ensureColumn("trivia_reward_questions", "source", "VARCHAR(16) NOT NULL DEFAULT 'panel'")
     ensureColumn("trivia_reward_questions", "created_at", "INT NOT NULL DEFAULT 0")
+    -- 定时启停（面板「运行状态」页的定时计划）
+    ensureColumn("trivia_reward_settings", "schedule_enabled", "TINYINT NOT NULL DEFAULT 0")
+    ensureColumn("trivia_reward_settings", "schedule_windows", "VARCHAR(255) NOT NULL DEFAULT ''")
 
     return true
 end
@@ -1621,6 +1649,9 @@ local function finishRound(winner, reason)
     elseif reason == "stopped" then
         broadcast(string.format("%s本题已被管理员取消。正确答案是「%s」。", cfg.prefix, answer))
         logInfo("第 %d 题被管理员取消。", round.questionNo)
+    elseif reason == "scheduled" then
+        broadcast(string.format("%s答题活动到点了，本题提前结束。正确答案是「%s」。", cfg.winPrefix, answer))
+        logInfo("第 %d 题因定时计划结束而提前收尾。", round.questionNo)
     end
 end
 
@@ -1860,6 +1891,343 @@ local function onLoginImpl(event, player)
     end
 end
 
+--================================================================= 定时启停计划
+-- 面板里配的"每天 8:00-9:00 开启答题"就是这块。
+-- 纯函数部分（解析/判定）不依赖任何运行状态，方便离线测试。
+local SCHEDULE_DAY_NAMES = {
+    ["mon"] = 1, ["tue"] = 2, ["wed"] = 3, ["thu"] = 4, ["fri"] = 5, ["sat"] = 6, ["sun"] = 7,
+    ["一"] = 1, ["二"] = 2, ["三"] = 3, ["四"] = 4, ["五"] = 5, ["六"] = 6, ["日"] = 7, ["天"] = 7,
+}
+
+-- "08:00-09:00" / "8:00-9:00" → from, to（分钟）
+local function parseClockRange(text)
+    local h1, m1, h2, m2 = tostring(text):match("^(%d%d?):(%d%d)%s*%-%s*(%d%d?):(%d%d)$")
+    if h1 == nil then
+        return nil
+    end
+    h1, m1, h2, m2 = tonumber(h1), tonumber(m1), tonumber(h2), tonumber(m2)
+    if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59 then
+        return nil
+    end
+    return (h1 * 60 + m1), (h2 * 60 + m2)
+end
+
+local function formatClockRange(fromMin, toMin)
+    return string.format("%02d:%02d-%02d:%02d", math.floor(fromMin / 60), fromMin % 60, math.floor(toMin / 60), toMin % 60)
+end
+
+-- 星期掩码 → "1,2,3,4,5"（与面板归一化后的写法一致）
+local function formatDaySetText(days)
+    local out = {}
+    for day = 1, 7 do
+        if days[day] then
+            out[#out + 1] = tostring(day)
+        end
+    end
+    return table.concat(out, ",")
+end
+
+-- 秒 → "1 小时 5 分钟" / "5 分钟" / "30 秒"
+local function formatDuration(seconds)
+    local s = math.max(0, math.floor(tonumber(seconds) or 0))
+    if s < 60 then
+        return s .. " 秒"
+    end
+    local minutes = math.floor(s / 60)
+    if minutes < 60 then
+        return minutes .. " 分钟"
+    end
+    local hours = math.floor(minutes / 60)
+    local rest = minutes % 60
+    if rest == 0 then
+        return hours .. " 小时"
+    end
+    return hours .. " 小时 " .. rest .. " 分钟"
+end
+
+-- "1-5" / "6,7" / "mon-fri" / "一,三,五" → { [1]=true, ... }（1=周一 … 7=周日）
+local function parseDaySet(text)
+    local days = {}
+    for chunk in tostring(text):gmatch("[^,]+") do
+        chunk = chunk:lower():gsub("%s+", "")
+        if chunk ~= "" then
+            local a, b = chunk:match("^([^%-]+)%-([^%-]+)$")
+            if a == nil then
+                a, b = chunk, chunk
+            end
+            local from = tonumber(a) or SCHEDULE_DAY_NAMES[a]
+            local to = tonumber(b) or SCHEDULE_DAY_NAMES[b]
+            if from == nil or to == nil or from < 1 or from > 7 or to < 1 or to > 7 then
+                return nil
+            end
+            local day = from
+            while true do
+                days[day] = true
+                if day == to then
+                    break
+                end
+                day = day % 7 + 1
+            end
+        end
+    end
+    if next(days) == nil then
+        return nil
+    end
+    return days
+end
+
+-- 解析 scheduleWindows；非法片段直接跳过（面板侧也会校验，这里只保证不会因此崩掉）
+--
+-- 拆分规则（与面板的 ScheduleWindows.php 一致）：
+--   * 先用 ; 与换行切成段；
+--   * 段里有 @ 时，@ 之前是星期、之后是时间；时间部分再按逗号拆（共享同一组星期），
+--     所以 "1-5@08:00-09:00, 20:00-22:00" = 工作日两段；星期本身可以用逗号（"6,7@..."）；
+--   * 段里没有 @ 时，整个段按逗号拆成多段（每天）。
+local function parseScheduleWindows(raw)
+    local list = {}
+    local text = tostring(raw or "")
+    if type(raw) == "table" then
+        text = table.concat(raw, ";")
+    end
+
+    -- 先展开成 { days = 星期掩码或 nil, time = "08:00-09:00" } 的组合
+    local combos = {}
+    for piece in text:gmatch("[^;\r\n]+") do
+        local trimmed = piece:gsub("^%s+", ""):gsub("%s+$", "")
+        if trimmed ~= "" then
+            local dayPart, timePart = nil, trimmed
+            local at = trimmed:match(".*()@")   -- 贪婪匹配 = 最后一个 @
+            if at ~= nil then
+                dayPart = trimmed:sub(1, at - 1):gsub("^%s+", ""):gsub("%s+$", "")
+                timePart = trimmed:sub(at + 1)
+            end
+
+            local days = nil
+            local dayOk = true
+            if dayPart ~= nil then
+                days = parseDaySet(dayPart)
+                if days == nil then
+                    logError("定时计划「%s」的星期写法无法识别，已跳过这一段。", trimmed)
+                    dayOk = false
+                end
+            end
+
+            if dayOk then
+                for sub in timePart:gmatch("[^,]+") do
+                    sub = sub:gsub("^%s+", ""):gsub("%s+$", "")
+                    if sub ~= "" then
+                        combos[#combos + 1] = { days = days, time = sub, source = trimmed }
+                    end
+                end
+            end
+        end
+    end
+
+    for i = 1, #combos do
+        local combo = combos[i]
+        local from, to = parseClockRange(combo.time)
+        if from == nil or from == to then
+            logError("定时计划「%s」的时间段无法识别（应形如 08:00-09:00），已跳过这一段。", combo.source)
+        else
+            local label = formatClockRange(from, to)
+            if combo.days ~= nil then
+                label = formatDaySetText(combo.days) .. "@" .. label
+            end
+            list[#list + 1] = { from = from, to = to, days = combo.days, text = label }
+        end
+    end
+
+    return list
+end
+
+-- 1=周一 … 7=周日（Lua 的 wday 是 1=周日）
+local function isoWeekday(t)
+    local wday = tonumber(os.date("%w", t)) or 0   -- 0=周日
+    return wday == 0 and 7 or wday
+end
+
+local function clockMinutes(t)
+    local d = os.date("*t", t)
+    return (tonumber(d.hour) or 0) * 60 + (tonumber(d.min) or 0)
+end
+
+-- 这一时刻是否落在某一段里；跨夜段（22:00-02:00）按"段开始的那天"判断星期
+local function windowActiveAt(t, w)
+    local minutes = clockMinutes(t)
+    local day = isoWeekday(t)
+    if w.from < w.to then
+        if w.days ~= nil and not w.days[day] then
+            return false
+        end
+        return minutes >= w.from and minutes < w.to
+    end
+
+    -- 跨夜：今天 from 点之后，或明天 to 点之前
+    if minutes >= w.from then
+        return w.days == nil or w.days[day] == true
+    end
+    if minutes < w.to then
+        local prev = day == 1 and 7 or (day - 1)
+        return w.days == nil or w.days[prev] == true
+    end
+    return false
+end
+
+-- 返回 active, 命中的段；没有任何段命中时第二个返回值为下一次要开启的段
+local function scheduleActiveAt(t, list)
+    for i = 1, #list do
+        if windowActiveAt(t, list[i]) then
+            return true, list[i]
+        end
+    end
+    return false, nil
+end
+
+-- 距下一次"计划状态翻转"还有多少秒（0 = 没有可用计划），只用于面板展示
+local function scheduleNextChange(t, list)
+    if #list == 0 then
+        return 0
+    end
+    local active = scheduleActiveAt(t, list)
+    local best = nil
+    local dayStart = t - clockMinutes(t) * 60 - (tonumber(os.date("%S", t)) or 0)
+    for i = 1, #list do
+        for offset = 0, 7 do
+            local base = dayStart + offset * 86400
+            local from = base + list[i].from * 60
+            local to = base + list[i].to * 60
+            if list[i].from >= list[i].to then
+                to = to + 86400
+            end
+            local candidates = active and { to } or { from }
+            for c = 1, #candidates do
+                local moment = candidates[c]
+                if moment > t and (best == nil or moment < best) then
+                    best = moment
+                end
+            end
+        end
+    end
+    if best == nil then
+        return 0
+    end
+    return best - t
+end
+
+local scheduleCache = { raw = nil, list = nil }
+
+local function scheduleWindowsRaw()
+    local value = TR.Config.scheduleWindows
+    if type(value) == "table" then
+        return table.concat(value, ";")
+    end
+    return tostring(value or "")
+end
+
+local function scheduleWindows()
+    local raw = scheduleWindowsRaw()
+    if scheduleCache.raw ~= raw then
+        scheduleCache.raw = raw
+        scheduleCache.list = parseScheduleWindows(raw)
+    end
+    return scheduleCache.list
+end
+
+-- 手动 enable/disable 时如果定时计划开着，提醒一句：计划会在下个 tick 覆盖手动开关
+local function scheduleHint()
+    if TR.Config.scheduleEnabled ~= true then
+        return ""
+    end
+    local list = scheduleWindows()
+    if #list == 0 then
+        return "（注意：定时计划已启用，但还没有有效时间段）"
+    end
+    return "（注意：定时计划已启用，手动开关会在 1 秒内被计划覆盖，详见 .trivia schedule）"
+end
+
+local function scheduleSummaryText()
+    local cfg = TR.Config
+    local list = scheduleWindows()
+    local parts = {}
+    for i = 1, #list do
+        parts[#parts + 1] = list[i].text
+    end
+
+    local state = "未启用"
+    if cfg.scheduleEnabled then
+        if #list == 0 then
+            state = "已启用（无有效时间段）"
+        else
+            local active = scheduleActiveAt(now(), list)
+            local nextIn = scheduleNextChange(now(), list)
+            state = (active and "活动中" or "未到时间")
+                .. (nextIn > 0 and ("，" .. (active and "还有 " or "距下次开启 ") .. formatDuration(nextIn)) or "")
+        end
+    end
+
+    return string.format("定时启停：%s；时间段：%s；系统开关：%s；当前：%s",
+        cfg.scheduleEnabled and "已启用" or "未启用",
+        #parts > 0 and table.concat(parts, "，") or "（无）",
+        cfg.enabled and "开" or "关",
+        state)
+end
+
+-- 按计划强制开关：进入时间段自动开启，离开时间段自动结束并停题。
+-- 计划开启时它的优先级高于 .trivia enable / disable（面板会给出提示）。
+local function applySchedule(t)
+    local cfg = TR.Config
+    if not cfg.scheduleEnabled then
+        TR.scheduleInfo = nil
+        return
+    end
+
+    local list = scheduleWindows()
+    if #list == 0 then
+        TR.scheduleInfo = { active = false, window = nil, nextChange = 0, empty = true }
+        return
+    end
+
+    local active, hit = scheduleActiveAt(t, list)
+    local wasActive = TR.scheduleActive == true
+    TR.scheduleActive = active
+    TR.scheduleInfo = {
+        active = active,
+        window = hit and hit.text or nil,
+        nextChange = scheduleNextChange(t, list),
+        empty = false,
+    }
+
+    if active then
+        if not cfg.enabled then
+            cfg.enabled = true
+            TR.paused = false
+            if not round.active and (TR.nextRoundAt or 0) > t + (tonumber(cfg.resumeDelaySeconds) or 5) then
+                TR.nextRoundAt = t + (tonumber(cfg.resumeDelaySeconds) or 5)
+            end
+            broadcast(string.format("%s答题活动已按定时计划开启（%s），祝你好运！", cfg.prefix, tostring(hit.text)))
+            -- 定时计划一天只会翻转几次，属于运维事件：无条件写日志（不受 Config.debug 影响）
+            PrintInfo("[答题] 定时计划：进入 " .. tostring(hit.text) .. "，已自动开启答题。")
+        end
+        return
+    end
+
+    if cfg.enabled then
+        cfg.enabled = false
+        local hadRound = round.active
+        if round.active then
+            finishRound(nil, "scheduled")
+        end
+        -- 只在"真的从活动中掉出来"时播报，避免服务器刚启动（库里开关是 1、当前不在时间段）就发一条"活动已结束"
+        if wasActive or hadRound then
+            local nextIn = scheduleNextChange(t, list)
+            broadcast(string.format("%s本次答题活动已结束（定时计划）。%s", cfg.winPrefix,
+                nextIn > 0 and ("下次开启还有 " .. formatDuration(nextIn) .. "。") or ""))
+        end
+        -- 定时计划一天只会翻转几次，属于运维事件：无条件写日志（不受 Config.debug 影响）
+        PrintInfo("[答题] 定时计划：不在时间段内，已自动关闭答题。")
+    end
+end
+
 --================================================================= 定时器
 local function tickBody()
     local cfg = TR.Config
@@ -1874,11 +2242,14 @@ local function tickBody()
         end
     end
 
+    local t = now()
+
+    -- 定时计划先于开关判定：它自己会改写 cfg.enabled
+    applySchedule(t)
+
     if not cfg.enabled then
         return
     end
-
-    local t = now()
 
     if round.active then
         if t >= round.deadlineAt then
@@ -2044,6 +2415,20 @@ local function statusJson()
         state = "paused"
     end
 
+    -- 定时计划：面板靠这几个字段显示"计划生效中 / 距下次开关还有多久"
+    local schedEnabled = cfg.scheduleEnabled == true
+    local schedList = schedEnabled and scheduleWindows() or {}
+    local schedActive = false
+    local schedNext = 0
+    if schedEnabled and #schedList > 0 then
+        schedActive = scheduleActiveAt(t, schedList)
+        schedNext = scheduleNextChange(t, schedList)
+    end
+    local schedParts = {}
+    for i = 1, #schedList do
+        schedParts[#schedParts + 1] = schedList[i].text
+    end
+
     local parts = {
         '"ok":true',
         '"state":' .. jsonString(state),
@@ -2056,6 +2441,13 @@ local function statusJson()
         '"answer_text":' .. jsonString(q and q.options[q.correct] or ""),
         '"remaining":' .. tostring(round.active and math.max(0, round.deadlineAt - t) or 0),
         '"next_in":' .. tostring((not round.active) and math.max(0, (TR.nextRoundAt or 0) - t) or 0),
+        '"schedule_enabled":' .. tostring(schedEnabled),
+        '"schedule_active":' .. tostring(schedActive),
+        '"schedule_valid":' .. tostring(schedEnabled and #schedList > 0),
+        '"schedule_windows":' .. jsonString(table.concat(schedParts, "; ")),
+        '"schedule_next_change":' .. tostring(schedNext),
+        '"schedule_next_change_text":' .. jsonString(schedNext > 0 and formatDuration(schedNext) or ""),
+        '"schedule_hint":' .. jsonString(scheduleHint()),
         '"bank":' .. tostring(#(TR.ActiveQuestions or {})),
         '"builtin":' .. tostring(tonumber(TR.builtinCount) or 0),
         '"custom":' .. tostring(tonumber(TR.customCount) or 0),
@@ -2125,27 +2517,43 @@ local function onCommandImpl(event, player, command, chatHandler)
     end
 
     if sub == "pause" or sub == "off" then
+        if TR.paused then
+            replyTo(chatHandler, player, true, "自动出题已经是暂停状态（当前题目继续到结束）。")
+            return false
+        end
         TR.paused = true
-        replyTo(chatHandler, player, true, "已暂停自动出题（当前题目不受影响）。")
+        replyTo(chatHandler, player, true, "已暂停自动出题（当前题目继续到结束；用 .trivia resume 恢复）。")
         return false
     end
 
     if sub == "resume" or sub == "on" then
+        local delay = tonumber(cfg.resumeDelaySeconds) or 5
         TR.paused = false
-        if not round.active and (TR.nextRoundAt or 0) < now() then
-            TR.nextRoundAt = now() + 5
+        -- 无条件把下一题提前：否则"暂停→恢复"之后还要等完整个 intervalSeconds（默认 900 秒），
+        -- 面板上看起来就是"恢复按钮点了没用"。
+        if not round.active and (TR.nextRoundAt or 0) > now() + delay then
+            TR.nextRoundAt = now() + delay
         end
-        replyTo(chatHandler, player, true, "已恢复自动出题。")
+        if not cfg.enabled then
+            replyTo(chatHandler, player, true, string.format(
+                "已取消暂停，但答题系统当前是关闭状态（用 .trivia enable 打开）。%s", scheduleHint()))
+        elseif round.active then
+            replyTo(chatHandler, player, true, "已恢复自动出题（当前题目结束后 " .. tostring(cfg.intervalSeconds) .. " 秒出下一题）。")
+        else
+            replyTo(chatHandler, player, true, string.format("已恢复自动出题，约 %d 秒后出下一题。", delay))
+        end
         return false
     end
 
     if sub == "enable" then
+        local delay = tonumber(cfg.resumeDelaySeconds) or 5
         cfg.enabled = true
         TR.paused = false
-        if (TR.nextRoundAt or 0) < now() then
-            TR.nextRoundAt = now() + 5
+        if not round.active and (TR.nextRoundAt or 0) > now() + delay then
+            TR.nextRoundAt = now() + delay
         end
-        replyTo(chatHandler, player, true, "答题系统已开启。")
+        replyTo(chatHandler, player, true, string.format("答题系统已开启，约 %d 秒后出下一题（重启服务器后以数据库/配置文件为准）。%s",
+            delay, scheduleHint()))
         return false
     end
 
@@ -2154,7 +2562,19 @@ local function onCommandImpl(event, player, command, chatHandler)
         if round.active then
             finishRound(nil, "stopped")
         end
-        replyTo(chatHandler, player, true, "答题系统已关闭（重启服务器后以数据库/配置文件为准）。")
+        replyTo(chatHandler, player, true, "答题系统已关闭（重启服务器后以数据库/配置文件为准）。" .. scheduleHint())
+        return false
+    end
+
+    if sub == "schedule" then
+        local list = scheduleWindows()
+        if not cfg.scheduleEnabled then
+            replyTo(chatHandler, player, true, "定时启停：未启用。可在 AGMP 面板的聊天答题页「运行状态」里配置每天的时间段。")
+        elseif #list == 0 then
+            replyTo(chatHandler, player, true, "定时启停：已启用，但还没有有效的时间段。")
+        else
+            replyTo(chatHandler, player, true, scheduleSummaryText())
+        end
         return false
     end
 
@@ -2223,12 +2643,13 @@ local function onCommandImpl(event, player, command, chatHandler)
         elseif round.active then
             state = string.format("进行中（第 %d 题，剩余 %d 秒）", round.questionNo, math.max(0, round.deadlineAt - now()))
         else
-            state = string.format("空闲（下一题约 %d 秒后）", math.max(0, (TR.nextRoundAt or 0) - now()))
+            state = string.format("空闲（下一题约 %s后）", formatDuration(math.max(0, (TR.nextRoundAt or 0) - now())))
         end
         replyTo(chatHandler, player, true, string.format(
-            "状态：%s；题库：%d 题（内置 %d + 自定义 %d）；作答来源：%s；已出题：%d 次；在线：%d 人；间隔：%d 秒/题，作答：%d 秒。",
+            "状态：%s；题库：%d 题（内置 %d + 自定义 %d）；作答来源：%s；已出题：%d 次；在线：%d 人；间隔：%d 秒/题，作答：%d 秒。%s",
             state, #(TR.ActiveQuestions or {}), tonumber(TR.builtinCount) or 0, tonumber(TR.customCount) or 0,
-            answerSourcesText(), TR.roundCounter, GetPlayerCount(), cfg.intervalSeconds, cfg.answerSeconds))
+            answerSourcesText(), TR.roundCounter, GetPlayerCount(), cfg.intervalSeconds, cfg.answerSeconds,
+            scheduleSummaryText()))
         return false
     end
 
@@ -2238,7 +2659,7 @@ local function onCommandImpl(event, player, command, chatHandler)
     end
 
     replyTo(chatHandler, player, true,
-        "用法：.trivia start [题号] | stop | pause(on/off) | resume | enable | disable | reload | api | status | stats | chanscan [秒] | chanlist")
+        "用法：.trivia start [题号] | stop | pause(on/off) | resume | enable | disable | reload | schedule | api | status | stats | chanscan [秒] | chanlist")
     return false
 end
 

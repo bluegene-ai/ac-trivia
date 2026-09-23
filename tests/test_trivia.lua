@@ -541,6 +541,207 @@ check(TR.roundCounter == pausedCount, ".trivia pause 后不出新题")
 cmd("trivia resume")
 cmd("trivia stop")
 
+print("== 14b. 恢复自动出题：无条件把下一题提前 ==")
+-- 曾经的 bug：finishRound 把下一题排到 now+intervalSeconds（默认 900 秒），而 resume 只在
+-- nextRoundAt 已过期时才提前，于是"暂停 → 恢复"之后还要干等 15 分钟，看起来就是恢复无效。
+TR.Config.scheduleEnabled = false
+TR.Config.scheduleWindows = ""
+TR.Config.intervalSeconds = 900
+TR.Config.resumeDelaySeconds = 5
+TR.paused = false
+TR.Config.enabled = true
+
+cmd("trivia start")
+cmd("trivia stop")
+check(TR.nextRoundAt > fakeTime + 800,
+    "结束当前题后，下一题按出题间隔排期（" .. tostring(TR.nextRoundAt - fakeTime) .. " 秒后）")
+local roundsBeforeResume = TR.roundCounter
+fakeTime = fakeTime + 1
+tick()
+check(TR.roundCounter == roundsBeforeResume, "间隔没到不会自动出下一题")
+
+check(cmd("trivia pause").sent[1]:find("已暂停自动出题", 1, true) ~= nil, ".trivia pause 回复明确")
+check(cmd("trivia pause").sent[1]:find("已经是暂停状态", 1, true) ~= nil, "重复暂停给出「已经是暂停」的提示")
+fakeTime = fakeTime + 1
+tick()
+check(TR.roundCounter == roundsBeforeResume, "暂停期间不出新题")
+
+local resumeReply = cmd("trivia resume")
+check(TR.paused == false, ".trivia resume 清掉暂停标记")
+check(resumeReply.sent[1]:find("恢复自动出题", 1, true) ~= nil, ".trivia resume 回复明确")
+check(TR.nextRoundAt <= fakeTime + 5, "恢复后下一题被提前到 " .. tostring(TR.nextRoundAt - fakeTime) .. " 秒后")
+fakeTime = fakeTime + 6
+tick()
+check(TR.roundCounter == roundsBeforeResume + 1, "恢复后自动出下一题（不再等满 intervalSeconds）")
+check(TR.round.active == true, "恢复后的新题已经在进行中")
+cmd("trivia stop")
+
+print("== 14c. 定时启停计划 ==")
+-- 造一个"指定本地时刻"的时间戳（os.time 被测试替换了，所以自己扫）
+local function tsAt(wday, hh, mm)
+    -- wday: 0=周日 … 6=周六；nil = 不看星期
+    local base = fakeTime - (fakeTime % 60)
+    for i = 0, 9 * 24 * 60 do
+        local cand = base + i * 60
+        local d = os.date("*t", cand)
+        if d.hour == hh and d.min == mm and (wday == nil or tonumber(os.date("%w", cand)) == wday) then
+            return cand
+        end
+    end
+    return nil
+end
+
+-- 新列已经写进默认设置行
+local seededSettings = db.tables.trivia_reward_settings[1]
+check(seededSettings.schedule_enabled ~= nil and tonumber(seededSettings.schedule_enabled) == 0,
+    "默认设置行带 schedule_enabled=0")
+check(seededSettings.schedule_windows ~= nil and seededSettings.schedule_windows == "",
+    "默认设置行带 schedule_windows=''")
+
+TR.Config.scheduleEnabled = true
+TR.Config.scheduleWindows = "08:00-09:00"
+local inMorning = tsAt(nil, 8, 30)
+local beforeMorning = tsAt(nil, 7, 30)
+check(inMorning ~= nil and beforeMorning ~= nil, "测试环境能构造出指定时刻的时间戳")
+
+-- 时间段外：即使库/配置里开关是开的，也会被计划关掉
+fakeTime = beforeMorning
+TR.Config.enabled = true
+TR.paused = false
+TR.scheduleActive = nil
+clearWorld()
+tick()
+check(TR.Config.enabled == false, "不在时间段内 → 计划自动关闭系统")
+check(TR.round.active == false, "关闭时不会留着一道没结束的题")
+
+-- 进入时间段：自动开启 + 到点出题
+cmd("trivia stop")
+fakeTime = inMorning
+clearWorld()
+logs = {}
+tick()
+check(TR.Config.enabled == true, "进入时间段 → 计划自动开启系统")
+check(TR.scheduleInfo ~= nil and TR.scheduleInfo.active == true, "计划状态标记为进行中")
+local opened = false
+for i = 1, #world do
+    if world[i]:find("已按定时计划开启", 1, true) then opened = true end
+end
+check(opened, "开启时向全服播报了一次")
+fakeTime = fakeTime + 6
+tick()
+check(TR.round.active == true, "计划开启后自动出题")
+check(logHas("定时计划"), "计划动作写入 ALE 日志")
+
+-- 到点结束：结束当前题 + 停题
+fakeTime = tsAt(nil, 9, 0)
+clearWorld()
+tick()
+check(TR.Config.enabled == false, "离开时间段 → 计划自动关闭系统")
+check(TR.round.active == false, "到点会结束正在进行的那道题")
+local ended = false
+for i = 1, #world do
+    if world[i]:find("本次答题活动已结束", 1, true) then ended = true end
+end
+check(ended, "结束时有播报（含下次开启时间）")
+
+-- 跨夜时间段
+TR.Config.enabled = false
+TR.Config.scheduleWindows = "22:00-02:00"
+TR.scheduleActive = nil
+fakeTime = tsAt(nil, 23, 0)
+tick()
+check(TR.Config.enabled == true, "跨夜时间段：23:00 在 22:00-02:00 之内")
+fakeTime = tsAt(nil, 1, 0)
+tick()
+check(TR.Config.enabled == true, "跨夜时间段：次日 01:00 仍在 22:00-02:00 之内")
+fakeTime = tsAt(nil, 3, 0)
+tick()
+check(TR.Config.enabled == false, "跨夜时间段：03:00 已在外（自动结束）")
+
+-- 星期限制（1 = 周一）
+TR.Config.enabled = false
+TR.Config.scheduleWindows = "1@08:00-09:00"
+TR.scheduleActive = nil
+fakeTime = tsAt(1, 8, 30)
+tick()
+check(TR.Config.enabled == true, "周一 08:30 落在「1@08:00-09:00」内")
+fakeTime = tsAt(2, 8, 30)
+tick()
+check(TR.Config.enabled == false, "周二 08:30 不在「1@08:00-09:00」内")
+
+-- 多个时间段 / 逗号分隔写法
+TR.Config.scheduleWindows = "08:00-09:00, 20:00-22:00"
+TR.scheduleActive = nil
+fakeTime = tsAt(nil, 21, 0)
+tick()
+check(TR.Config.enabled == true, "逗号分隔的第二段（20:00-22:00）也生效")
+
+-- 带星期前缀 + 逗号多段（"1-5@08:00-09:00, 20:00-22:00" = 工作日两段）
+TR.Config.enabled = false
+TR.Config.scheduleWindows = "1-5@08:00-09:00, 20:00-22:00"
+TR.scheduleActive = nil
+fakeTime = tsAt(3, 21, 0)          -- 周三晚上
+tick()
+check(TR.Config.enabled == true, "星期前缀 + 逗号多段：周三 21:00 命中第二段")
+fakeTime = tsAt(6, 21, 0)          -- 周六晚上（不在 1-5）
+tick()
+check(TR.Config.enabled == false, "同一段的星期限制同样作用于第二段（周六不生效）")
+check(TR.scheduleInfo ~= nil and TR.scheduleInfo.active == false, "计划状态标记为不在时间段内")
+
+-- 星期写法的规范化文本（面板归一化成 1,2,3,4,5，脚本要能读懂同一种写法）
+TR.Config.enabled = false
+TR.Config.scheduleWindows = "1,2,3,4,5@08:00-09:00"
+TR.scheduleActive = nil
+fakeTime = tsAt(4, 8, 30)
+tick()
+check(TR.Config.enabled == true, "面板归一化写法 1,2,3,4,5@08:00-09:00 可识别")
+
+-- 手动开关被计划覆盖，并且提示里说明白
+TR.Config.scheduleWindows = "08:00-09:00"
+fakeTime = tsAt(nil, 7, 0)
+tick()
+check(TR.Config.enabled == false, "时间段外保持关闭")
+local manualEnable = cmd("trivia enable")
+check(manualEnable.sent[1]:find("定时计划", 1, true) ~= nil, ".trivia enable 会提示定时计划优先")
+check(TR.Config.enabled == true, "手动 enable 当次生效")
+fakeTime = fakeTime + 1
+tick()
+check(TR.Config.enabled == false, "下一个 tick 就被计划拉回关闭状态")
+
+-- .trivia schedule 指令
+TR.Config.scheduleEnabled = false
+TR.Config.scheduleWindows = ""
+TR.scheduleActive = nil
+local schedCmd = cmd("trivia schedule")
+check(#schedCmd.sent == 1 and schedCmd.sent[1]:find("定时启停", 1, true) ~= nil,
+    ".trivia schedule 可执行并在未启用时说明")
+TR.Config.scheduleEnabled = true
+TR.Config.scheduleWindows = "08:00-09:00; 20:00-22:00"
+local schedCmd2 = cmd("trivia schedule")
+check(schedCmd2.sent[1]:find("08:00-09:00", 1, true) ~= nil and schedCmd2.sent[1]:find("20:00-22:00", 1, true) ~= nil,
+    ".trivia schedule 列出全部时间段")
+
+-- 非法写法不会把脚本弄崩，只是被跳过
+TR.Config.scheduleWindows = "这不是时间段"
+TR.scheduleActive = nil
+local okBad = pcall(tick)
+check(okBad == true, "非法时间段不会抛错")
+check(TR.Config.enabled == false, "非法时间段视作没有计划（保持关闭）")
+
+-- 日志里能看出是哪一段被跳过（运维排查用）
+logs = {}
+TR.Config.scheduleWindows = "08:00-09:00; 25:00-26:00"
+TR.scheduleActive = nil
+pcall(tick)
+check(logHas("25:00-26:00"), "非法时间段会写日志指出具体是哪一段")
+
+-- 复位，避免影响后面的用例
+TR.Config.scheduleEnabled = false
+TR.Config.scheduleWindows = ""
+TR.scheduleActive = nil
+TR.Config.enabled = true
+TR.Config.intervalSeconds = 900
+
 print("== 15. 种子开关 / 空题库 ==")
 -- use_builtin_questions 现在表示"首次建库时是否导入内置种子题库"；
 -- 数据库一旦有题就以数据库为准，这里模拟"题库被清空"的极端情况。
@@ -803,6 +1004,32 @@ check(payload:find('"from_db":2', 1, true) ~= nil, "JSON from_db=2")
 check(payload:find('"db":true', 1, true) ~= nil, "JSON db=true")
 check(payload:find('"labels":"甲 / 乙 / 丙 / 丁"', 1, true) ~= nil, "JSON labels 为中文标号")
 check(payload:find('"channel_ids":"1,2"', 1, true) ~= nil, "JSON channel_ids=1,2")
+-- 面板的运行控制/倒计时/定时计划展示依赖下面这些字段，字段名两边必须一致
+check(payload:find('"enabled":', 1, true) ~= nil and payload:find('"paused":', 1, true) ~= nil,
+    "JSON 带 enabled / paused（面板据此决定按钮文案）")
+check(payload:find('"next_in":', 1, true) ~= nil, "JSON 带 next_in（下一题倒计时）")
+check(payload:find('"schedule_enabled":false', 1, true) ~= nil, "JSON schedule_enabled=false（未开定时）")
+check(payload:find('"schedule_windows":""', 1, true) ~= nil, "JSON schedule_windows 为空")
+check(payload:find('"schedule_active":false', 1, true) ~= nil, "JSON schedule_active=false")
+check(payload:find('"schedule_next_change_text":', 1, true) ~= nil, "JSON 带 schedule_next_change_text")
+cmd("trivia stop")
+TR.Config.scheduleEnabled = true
+TR.Config.scheduleWindows = "08:00-09:00"
+TR.Config.enabled = false
+fakeTime = tsAt(nil, 8, 30)
+tick()
+local hSched = cmd("trivia api")
+local schedPayload = (hSched.sent[1] or ""):gsub("^%[AGMP_OK%]%s*", "")
+check(schedPayload:find('"schedule_enabled":true', 1, true) ~= nil, "计划开启时 JSON schedule_enabled=true")
+check(schedPayload:find('"schedule_active":true', 1, true) ~= nil, "时间段内 JSON schedule_active=true")
+check(schedPayload:find('"schedule_windows":"08:00-09:00"', 1, true) ~= nil, "JSON 回显时间段文本")
+check(schedPayload:find('"schedule_next_change":' .. tostring(30 * 60), 1, true) ~= nil,
+    "JSON schedule_next_change = 30 分钟（到 09:00 结束）")
+check(schedPayload:find('"enabled":true', 1, true) ~= nil, "计划把它自己打开的开关反映到 JSON")
+TR.Config.scheduleEnabled = false
+TR.Config.scheduleWindows = ""
+TR.scheduleActive = nil
+TR.Config.enabled = true
 
 -- 交给真正的 JSON 解析器校验（Node），避免"看起来像 JSON"就通过
 local dump = io.open(SCRIPT_DIR .. "/payload.json", "w")

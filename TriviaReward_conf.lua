@@ -36,6 +36,18 @@ TriviaReward.Config.minLevel             = 1        -- 低于该等级的角色�
 TriviaReward.Config.ignoreGMs            = true     -- 开着 GM 标签的账号不参与
 TriviaReward.Config.gmRankExempt         = 3        -- GM 等级 >= 该值时不参与（0 = 不限制）
 TriviaReward.Config.debug                = false    -- true = 每题开始/结束、频道扫描写进 ALE 日志
+TriviaReward.Config.resumeDelaySeconds   = 5        -- .trivia resume / enable 之后多少秒出下一题
+
+-- 定时启停：按"每天的固定时间段"自动开启 / 结束答题活动（面板「运行状态」页也能改）。
+--   scheduleEnabled = true 时，时间段的优先级高于 .trivia enable / disable。
+--   时间段写法（分号分隔多段；不带星期前缀 = 每天；1=周一 … 7=周日）：
+--       "08:00-09:00"                    每天 08:00-09:00
+--       "08:00-09:00; 20:00-22:00"       每天两段
+--       "1-5@08:00-09:00"                周一至周五
+--       "6,7@20:00-21:00"                周六、周日
+--       "22:00-02:00"                    跨夜（到第二天凌晨 2 点）
+TriviaReward.Config.scheduleEnabled      = false
+TriviaReward.Config.scheduleWindows      = ""       -- 例： "08:00-09:00; 20:00-22:00"
 
 
 --==============================================================================
