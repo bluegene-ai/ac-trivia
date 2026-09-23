@@ -1,9 +1,26 @@
--- 测试脚手架：用假的 ALE API 模拟 worldserver，验证 TriviaReward.lua + TriviaReward_conf.lua
--- 运行: lua.exe test_trivia.lua <脚本路径> <配置路径> [conf-first]
+-- 测试脚手架：用假的 ALE API 模拟 worldserver，验证 TriviaReward.lua
+-- 运行: lua.exe test_trivia.lua <脚本路径> [conf-first]
+--
+-- TriviaReward_conf.lua 已退休，所以第二个参数现在是可选的：
+--   传了现存文件 → 仍旧按"脚本 + 该文件"跑（兼容旧命令行）；
+--   没传 / 文件不存在 → 只加载脚本（正常用法）。
 
 local SCRIPT = arg[1] or "E:/Server/lua/TriviaReward.lua"
-local CONF   = arg[2] or "E:/Server/lua/TriviaReward_conf.lua"
-local ORDER  = arg[3] or "script-first"
+local CONF, ORDER = nil, "script-first"
+do
+    local a2, a3 = arg[2], arg[3]
+    if a2 == "script-first" or a2 == "conf-first" then
+        ORDER = a2
+    elseif a2 ~= nil and a2 ~= "" then
+        CONF = a2
+        if a3 == "script-first" or a3 == "conf-first" then
+            ORDER = a3
+        end
+    end
+    if CONF == nil then
+        ORDER = "script-only"
+    end
+end
 local SCRIPT_DIR = (arg[0] or ""):match("^(.*)[/\\]") or "."
 
 local fakeTime = 1000000
@@ -234,12 +251,22 @@ local function runFile(path)
     chunk()
 end
 
-if ORDER == "conf-first" then
+if CONF ~= nil then
+    if loadfile(CONF) == nil then
+        print("  (提示) 找不到 " .. CONF .. " —— TriviaReward_conf.lua 已退休，直接只跑脚本即可")
+        CONF = nil
+        ORDER = "script-only"
+    end
+end
+
+if CONF ~= nil and ORDER == "conf-first" then
     runFile(CONF)
     runFile(SCRIPT)
 else
     runFile(SCRIPT)
-    runFile(CONF)
+    if CONF ~= nil then
+        runFile(CONF)
+    end
 end
 
 local TR = TriviaReward
@@ -285,16 +312,19 @@ check(type(handlers[EV_CHAT]) == "function" and type(handlers[EV_WHISPER]) == "f
     and type(handlers[EV_LOGIN]) == "function", "5 个事件回调都已注册")
 check(type(tickFn) == "function", "定时器已创建")
 
-print("== 2. 配置生效（" .. ORDER .. "）==")
-check(TR.Config.intervalSeconds == 900, "conf: intervalSeconds = 900", TR.Config.intervalSeconds)
-check(TR.Config.answerSeconds == 60, "conf: answerSeconds = 60")
-check(TR.Config.answerSay == true and TR.Config.answerEmote == false, "conf: 说话开 / 表情关")
-check(TR.RewardPresets.gold20 ~= nil and TR.RewardPresets.gold20.money == 200000, "conf: 自定义奖励预设 gold20")
-check(TR.RewardPresets.cloth5 ~= nil and TR.RewardPresets.cloth5.items[1][1] == 33470, "conf: 内置预设 cloth5 仍在")
-check(#TR.Questions == 0, "conf 不再存放题目数据（题库在数据库里）", #TR.Questions)
+print("== 2. 内置默认值（原 conf 里的值已并入脚本）==")
+check(TR.Config.intervalSeconds == 900, "内置默认 intervalSeconds = 900", TR.Config.intervalSeconds)
+check(TR.Config.answerSeconds == 60, "内置默认 answerSeconds = 60")
+check(TR.Config.answerSay == true and TR.Config.answerEmote == false, "内置默认 说话开 / 表情关")
+check(TR.Config.answerChannelIds ~= nil and #TR.Config.answerChannelIds == 1
+    and TR.Config.answerChannelIds[1] == "综合", "内置默认 answerChannelIds = { 综合 }")
+check(TR.RewardPresets.gold20 ~= nil and TR.RewardPresets.gold20.money == 200000, "内置预设 gold20（原 conf 自定义）")
+check(TR.RewardPresets.heal10 ~= nil and TR.RewardPresets.combo ~= nil, "内置预设 heal10 / combo（原 conf 自定义）")
+check(TR.RewardPresets.cloth5 ~= nil and TR.RewardPresets.cloth5.items[1][1] == 33470, "内置预设 cloth5 仍在")
+check(#TR.Questions == 0, "脚本不再存放题目数据（题库在数据库里）", #TR.Questions)
 
 print("== 3. 加载时自动建表 + 首次导入种子题库 ==")
--- 脚本把建表/种子导入放到第一个 tick 里做（保证 TriviaReward_conf.lua 已加载），
+-- 脚本把建表/种子导入放到第一个 tick 里做（保证所有脚本都已加载），
 -- 所以这里先跑一次 tick 再断言。
 tick()
 check(logHas("初始化") or #db.tables.trivia_reward_settings == 1, "启动后写入了默认设置行")
@@ -306,7 +336,7 @@ for i = 1, #db.executed do
 end
 check(createCount >= 4, "建了 4 张表（实际 " .. createCount .. "）", createCount)
 check(#db.tables.trivia_reward_questions == 37, "首次把内置 37 题导入题库表（实际 " .. #db.tables.trivia_reward_questions .. "）")
-check(#db.tables.trivia_reward_presets >= 9, "首次把奖励预设写入预设表（实际 " .. #db.tables.trivia_reward_presets .. "）")
+check(#db.tables.trivia_reward_presets >= 12, "首次把内置奖励预设写入预设表（实际 " .. #db.tables.trivia_reward_presets .. "）")
 check(#db.tables.trivia_reward_settings == 1, "首次写入 1 行默认设置")
 local seededRow = db.tables.trivia_reward_questions[1]
 check(seededRow ~= nil and seededRow.source == "seed", "种子题目标记为 source=seed", tostring(seededRow and seededRow.source))
@@ -318,8 +348,24 @@ end
 check(sortOrders[1] and sortOrders[2] and sortOrders[#db.tables.trivia_reward_questions],
     "种子题目的 sort_order 是 1..N（不是全都 1）")
 check(db.tables.trivia_reward_settings[1].answer_channel_ids == "综合",
-    "默认设置写的是 conf 里的值（而不是脚本默认值）：answer_channel_ids=综合",
+    "默认设置写入的是脚本内置默认值：answer_channel_ids=综合",
     tostring(db.tables.trivia_reward_settings[1].answer_channel_ids))
+
+-- 原 conf 专属的 9 项现在都写进默认设置行（面板可改）
+local seededSettings = db.tables.trivia_reward_settings[1]
+for _, pair in ipairs({
+    { "debug_log", 0 }, { "idle_retry_seconds", 5 }, { "resume_delay_seconds", 5 },
+    { "allow_loose_letter", 1 }, { "ignore_gms", 1 }, { "gm_rank_exempt", 3 },
+}) do
+    check(tonumber(seededSettings[pair[1]]) == pair[2],
+        "默认设置行含 " .. pair[1] .. "=" .. pair[2],
+        tostring(seededSettings[pair[1]]))
+end
+check(seededSettings.answer_hint ~= nil and seededSettings.answer_hint == "", "默认设置行含 answer_hint=''")
+check(seededSettings.broadcast_prefix ~= nil and seededSettings.broadcast_prefix:find("|cff00ff00", 1, true) == 1,
+    "默认设置行含 broadcast_prefix（绿色前缀）", tostring(seededSettings.broadcast_prefix))
+check(seededSettings.win_prefix ~= nil and seededSettings.win_prefix:find("|cffffd200", 1, true) == 1,
+    "默认设置行含 win_prefix（金色前缀）", tostring(seededSettings.win_prefix))
 
 print("== 4. 题库以数据库为准（面板/模板写库 → 脚本读库）==")
 local h0 = cmd("trivia status")
@@ -388,7 +434,7 @@ check(#mail == 0, "表情（answerEmote=false）不作答")
 handlers[EV_CHAT](EV_CHAT, p2, answerOf(q2), CHAT_YELL, 0)
 check(#mail == 1, "喊话（answerYell=true）可作答")
 
-print("== 6. 频道作答（conf: answerChannelIds = { 综合 }）==")
+print("== 6. 频道作答（内置默认 answerChannelIds = { 综合 }）==")
 startQ()
 local q3 = TR.round.question
 local p3 = makePlayer("玩家丙", 303)
@@ -1052,7 +1098,7 @@ db.failQueries = true
 TR.prepared = nil
 TR.Config.intervalSeconds = 900
 cmd("trivia reload")
-check(TR.Config.intervalSeconds == 900, "数据库不可用时保留文件配置的 intervalSeconds")
+check(TR.Config.intervalSeconds == 900, "数据库不可用时用内置默认 intervalSeconds=900")
 check(#bank() == 37, "数据库不可用时退回内置题库 37 题（实际 " .. #bank() .. "）")
 db.failQueries = false
 

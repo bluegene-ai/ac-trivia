@@ -1,10 +1,17 @@
 -- 把 TriviaReward.lua 真实执行的建表/初始化 SQL 抓出来，交给 mysql 客户端执行。
 -- 这样能校验脚本里的 DDL 在真实 MySQL 上是否成立，同时让面板在 worldserver 启动前就有表可用。
--- 用法: lua.exe dump_schema.lua <脚本> <配置> <输出.sql>
+-- 用法: lua.exe dump_schema.lua <脚本> [输出.sql]
+--       （兼容旧写法：第二个参数文件名里含 "conf" 时按配置文件加载，输出顺延到第三个参数）
 
 local SCRIPT = arg[1] or "E:/Server/lua/TriviaReward.lua"
-local CONF   = arg[2] or "E:/Server/lua/TriviaReward_conf.lua"
-local OUT    = arg[3] or "E:/Server/.tmp-luacheck/schema.sql"
+local CONF, OUT = nil, nil
+if arg[2] ~= nil and arg[2]:find("conf", 1, true) ~= nil then
+    CONF = arg[2]
+    OUT = arg[3]
+else
+    OUT = arg[2]
+end
+OUT = OUT or "E:/Server/.tmp-luacheck/schema.sql"
 
 os.time = function() return 1000000 end
 local world, handlers = {}, {}
@@ -43,7 +50,10 @@ function CharDBQuery(sql)
 end
 
 assert(loadfile(SCRIPT))()
-assert(loadfile(CONF))()
+if CONF ~= nil then
+    local confChunk = loadfile(CONF)
+    if confChunk ~= nil then confChunk() end
+end
 handlers[42](42, nil, "trivia status", { SendSysMessage = function() end })
 
 local f = assert(io.open(OUT, "w"))

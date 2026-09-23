@@ -1,14 +1,21 @@
--- 题库自检工具：加载 TriviaReward.lua + TriviaReward_conf.lua，打印最终解析结果
--- 用法:  lua.exe check_questions.lua <脚本> <配置> [快照路径]
+-- 题库自检工具：加载 TriviaReward.lua（可选再加载一个旧配置文件），打印最终解析结果
+-- 用法:  lua.exe check_questions.lua <脚本> [快照路径]
+--        （兼容旧写法：第二个参数文件名里含 "conf" 时按配置文件加载，快照顺延到第三个参数）
 -- 作用:
 --   有 db_snapshot.lua（由 dump_db_snapshot.php 从真实数据库导出）时，
 --   按脚本自身的解析规则校验**数据库里真实的题库**，写错的题会在这里暴露；
---   没有快照则模拟"数据库不可用"，校验内置题库 + 文件配置这条兜底路径。
+--   没有快照则模拟"数据库不可用"，校验内置题库这条兜底路径。
 
 local SCRIPT = arg[1] or "E:/Server/lua/TriviaReward.lua"
-local CONF   = arg[2] or "E:/Server/lua/TriviaReward_conf.lua"
+local CONF, SNAPSHOT = nil, nil
 local SCRIPT_DIR = (arg[0] or ""):match("^(.*)[/\\]") or "."
-local SNAPSHOT = arg[3] or (SCRIPT_DIR .. "/db_snapshot.lua")
+if arg[2] ~= nil and arg[2]:find("conf", 1, true) ~= nil then
+    CONF = arg[2]
+    SNAPSHOT = arg[3]
+else
+    SNAPSHOT = arg[2]
+end
+SNAPSHOT = SNAPSHOT or (SCRIPT_DIR .. "/db_snapshot.lua")
 
 local snapshot = nil
 do
@@ -92,10 +99,17 @@ function CharDBQuery(sql)
     return emptyQuery(rows)
 end
 
--- 第一个 tick（脚本把建表/种子导入放在这里，保证 conf 已加载）
+-- 第一个 tick（脚本把建表/种子导入放在这里，保证所有脚本都已加载）
 
 assert(loadfile(SCRIPT))()
-assert(loadfile(CONF))()
+if CONF ~= nil then
+    local confChunk = loadfile(CONF)
+    if confChunk ~= nil then
+        confChunk()
+    else
+        print("(提示) 找不到 " .. CONF .. " —— TriviaReward_conf.lua 已退休，忽略该参数")
+    end
+end
 handlers[42](42, nil, "trivia status", { SendSysMessage = function() end })
 
 local TR = TriviaReward

@@ -7,19 +7,20 @@
 
 | 文件 | 说明 |
 |---|---|
-| `test_trivia.lua` | 行为测试：186 项断言，覆盖出题/作答/发奖/频道/次数限制/超时/数据库/指令/暂停恢复/定时启停/异常兜底 |
+| `test_trivia.lua` | 行为测试：202 项断言，覆盖出题/作答/发奖/频道/次数限制/超时/数据库/指令/暂停恢复/定时启停/异常兜底 |
 | `check_questions.lua` | 题库自检：按脚本自身的解析规则校验题库，逐条列出被跳过的错题 |
 | `dump_schema.lua` | 把脚本真实执行的建表/初始化 SQL 抓成 `schema.sql`（校验 DDL，或给 DBA 预建表用） |
+
+> `TriviaReward_conf.lua` 已退休，这些工具不再需要它（旧的命令行传了也只会提示一句然后照常跑）。
 
 ## 跑测试
 
 ```bash
-# 行为测试（两种文件加载顺序都要过：ALE 不保证 lua_scripts 里的加载顺序）
-lua tests/test_trivia.lua TriviaReward.lua TriviaReward_conf.lua script-first
-lua tests/test_trivia.lua TriviaReward.lua TriviaReward_conf.lua conf-first
+# 行为测试
+lua tests/test_trivia.lua TriviaReward.lua
 
 # 题库自检（没有数据库快照时，校验的是内置题库兜底路径）
-lua tests/check_questions.lua TriviaReward.lua TriviaReward_conf.lua
+lua tests/check_questions.lua TriviaReward.lua
 ```
 
 退出码 0 = 全部通过。
@@ -44,13 +45,13 @@ return {
 ```
 
 ```bash
-lua tests/check_questions.lua TriviaReward.lua TriviaReward_conf.lua db_snapshot.lua
+lua tests/check_questions.lua TriviaReward.lua db_snapshot.lua
 ```
 
 ## 抓建表 SQL
 
 ```bash
-lua tests/dump_schema.lua TriviaReward.lua TriviaReward_conf.lua schema.sql
+lua tests/dump_schema.lua TriviaReward.lua schema.sql
 mysql --default-character-set=utf8mb4 -h 127.0.0.1 -P 3306 -u root -p ac_eluna -e "source schema.sql"
 ```
 

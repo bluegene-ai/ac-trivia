@@ -5,15 +5,19 @@
 --  依赖 API : RegisterPlayerEvent / CreateLuaEvent / RemoveEventById / SendWorldMessage
 --             GetPlayerCount / GetPlayerByName / GetItemTemplate / GetItemLink / SendMail
 --==============================================================================
---  配置文件（推荐用法）:
---    同级目录下的 TriviaReward_conf.lua 是给你改的配置文件，支持下面全部设置：
---      ① 开启/关闭与出题节奏      TriviaReward.Config.enabled / intervalSeconds / answerSeconds …
---      ② 发言频道（从哪里收答案） TriviaReward.Config.answerSay / answerYell / answerChannelIds …
---      ③ 题目与答案              TriviaReward.Questions = { { "题干", {"A","B","C","D"}, "答案" }, … }
---      ④ 奖励物品                TriviaReward.RewardPresets.xxx 与 TriviaReward.Config.defaultRewardPreset
---      ⑤ 播报文本与权限          TriviaReward.Config.prefix / mailSubject / minGMRankForCommand …
---    本文件里的同名项就是默认值：配置文件写了的以配置文件为准，没写的用这里的默认值，
---    所以本文件与配置文件的加载顺序不影响结果（谁先谁后都行）。
+--  配置（当前做法）:
+--    * 全部设置 / 题库 / 奖励预设都存在数据库里（默认库 ac_eluna，见下方 Config.dbName），
+--      用 AGMP 面板的「聊天答题」页（/trivia）改完点保存即时生效，不再需要改 Lua 文件。
+--    * 历史上还有一个 TriviaReward_conf.lua 配置文件，现已退休：它当年配的每一项
+--      都已经写进数据库（`trivia_reward_settings` 的各列），或并入本文件的默认值。
+--    * 本文件里的 setDefault(...) 就是"数据库还没有那行数据时的首启默认值"；
+--      表建成、第一行写入之后，一切以数据库为准（每次 .trivia reload 都会重新读库）。
+--    * 仍然只能在本文件里改的（属于脚本内部参数，面板没有对应列）：
+--        Config.dbName        数据表所在库（默认 ac_eluna，必须与面板 config/trivia.php 一致）
+--        Config.useDatabase   false = 完全不用数据库，退回内置题库 + Config.Questions
+--        Config.tickIntervalMs 内部定时器间隔（毫秒，默认 1000）
+--        Config.Questions     仅数据库不可用时使用的文件题库（默认空）
+--        TriviaReward.RewardPresets / ChannelNames / ChannelLabels 的内置表
 --==============================================================================
 --  管理员指南:
 --    * 放好文件后重启 worldserver，或在服务器控制台执行 .reload ale 热重载。
@@ -43,7 +47,7 @@
 TriviaReward = TriviaReward or {}
 local TR = TriviaReward
 
--- 只在键不存在时写默认值：这样无论本文件与 TriviaReward_conf.lua 谁先加载，覆盖都不会被冲掉
+-- 只在键不存在时写默认值：外部（别的脚本、旧配置文件）先设过就不覆盖
 local function setDefault(tbl, key, value)
     if tbl[key] == nil then
         tbl[key] = value
@@ -57,12 +61,12 @@ local C = TR.Config
 --  ① 配置：开启 / 关闭 与出题节奏
 --==============================================================================
 setDefault(C, "enabled", true)                  -- 总开关：false = 完全不运行（也可用 .trivia disable 运行时关闭）
-setDefault(C, "debug", false)                   -- true = 把每题开始/结束/频道扫描写进 ALE 日志
+setDefault(C, "debug", false)                   -- true = 把每题开始/结束/频道扫描写进 ALE 日志（面板里可开关）
 setDefault(C, "firstDelaySeconds", 60)          -- 服务器启动（或 .reload ale）后多少秒出第一题
-setDefault(C, "intervalSeconds", 600)           -- 上一题结束到下一题开始之间的间隔（秒）
+setDefault(C, "intervalSeconds", 900)           -- 上一题结束到下一题开始之间的间隔（秒）
 setDefault(C, "answerSeconds", 60)              -- 每题作答时间（秒），超时无人答对则公布答案
 setDefault(C, "remindEverySeconds", 30)         -- 作答期间每隔多少秒重发一次提示（0 = 不提醒）
-setDefault(C, "tickIntervalMs", 1000)           -- 内部定时器间隔（毫秒），一般不用改
+setDefault(C, "tickIntervalMs", 1000)           -- 内部定时器间隔（毫秒），一般不用改（面板没有这一项）
 setDefault(C, "minPlayersOnline", 1)            -- 在线人数少于该值时不出题
 setDefault(C, "idleRetrySeconds", 5)            -- 人数不足时，多少秒后重新检查
 setDefault(C, "resumeDelaySeconds", 5)          -- .trivia resume / enable 后多少秒出下一题
@@ -87,7 +91,7 @@ setDefault(C, "answerSay", true)                -- 普通说话 /s（CHAT_MSG_SA
 setDefault(C, "answerYell", true)               -- 喊话 /y（CHAT_MSG_YELL）
 setDefault(C, "answerEmote", false)             -- 表情 /e（CHAT_MSG_EMOTE，一般不需要）
 setDefault(C, "answerWhisper", false)           -- 悄悄话 /w（注意：任意私聊内容都会参与匹配，可能误判）
-setDefault(C, "answerChannelIds", {})           -- 频道作答：填频道 ID 或下面的内置频道名，例如 { "综合", 1, -5 }
+setDefault(C, "answerChannelIds", { "综合" })     -- 频道作答：填频道 ID 或下面的内置频道名，例如 { "综合", 1, -5 }；空 {} = 不接受频道发言
 setDefault(C, "answerPrefix", "")               -- 要求答案前缀，例如 "!" 表示必须发 "!A"；空 = 不要求
 setDefault(C, "allowLooseLetter", true)         -- 允许 "A." "A)" "A、" "A。" 这类写法
 -- 选项标号：播报里显示的标号，同时也是允许玩家输入的答案符号（默认 A/B/C/D）
@@ -105,7 +109,7 @@ setDefault(C, "gmRankExempt", 3)                -- GM 等级 >= 该值时不参�
 setDefault(C, "minLevel", 1)                    -- 低于该等级的角色不参与
 
 -- 内置频道 ID 对照表（取自本服客户端 ChatChannels.dbc，管理员可用 .trivia chanscan 核对自定义频道）
--- 注意：逐个合并而不是整体赋值，这样配置文件里 if 先加载并建了空表也不会把内置对照表顶掉
+-- 注意：逐个合并而不是整体赋值，这样即使外面先建了空表也不会把内置对照表顶掉
 local BUILTIN_CHANNEL_NAMES = {
     general        = 1,   ["综合"]     = 1,
     trade          = 2,   ["交易"]     = 2,
@@ -136,8 +140,8 @@ end
 --==============================================================================
 --  ③ 配置：题目与答案
 --==============================================================================
-setDefault(C, "useBuiltinQuestions", true)      -- 是否使用脚本内置题库（false = 只用配置文件里的题目）
-TR.Questions = TR.Questions or {}               -- 你的题目：会追加在内置题库之后（推荐在 TriviaReward_conf.lua 里写）
+setDefault(C, "useBuiltinQuestions", true)      -- 首次建库时是否把脚本内置题库导入一次（之后题库以数据库为准）
+TR.Questions = TR.Questions or {}               -- 仅"数据库不可用"时使用的文件题库（默认空，题库请放数据库）
 
 --==============================================================================
 --  ④ 配置：奖励物品
@@ -145,7 +149,7 @@ TR.Questions = TR.Questions or {}               -- 你的题目：会追加在�
 setDefault(C, "rewardMode", "question")         -- "question" = 按题目自带奖励；"pool" = 每次从奖励池随机
 setDefault(C, "defaultRewardPreset", "cloth5")  -- 题目没写 reward 时用哪个预设
 setDefault(C, "poolPresets", {                  -- rewardMode = "pool" 时的随机奖励池
-    "cloth5", "cloth10", "heal5", "mana5", "ore5", "gold5", "gold10", "life2"
+    "cloth5", "cloth10", "heal5", "mana5", "ore5", "gold5", "gold10", "gold20", "combo"
 })
 setDefault(C, "senderGUID", 10667)              -- 邮件发送者的角色 low GUID（与本服 RecruitAFriend 保持一致）
 setDefault(C, "mailStationery", 41)             -- 邮件信纸：41 = 普通，61 = GM，62 = 拍卖行 …
@@ -161,6 +165,7 @@ setDefault(C, "mailBody",
 --     items = { 33470 }                     → 霜纹布 x1
 --     items = { { 33470, 5 } }              → 霜纹布 x5
 --     items = { { entry = 33470, count = 5 } }
+-- 这些只是"首次建库时的种子预设"；之后新增/修改预设请用面板（面板写 trivia_reward_presets 表）。
 TR.RewardPresets = TR.RewardPresets or {}
 local function preset(name, items, money)
     if TR.RewardPresets[name] == nil then
@@ -171,12 +176,15 @@ end
 preset("cloth5",  { { 33470, 5 } })                                     -- 霜纹布 x5
 preset("cloth10", { { 33470, 10 } })                                    -- 霜纹布 x10
 preset("heal5",   { { 33447, 5 } })                                     -- 符文治疗药水 x5
+preset("heal10",  { { 33447, 10 } })                                    -- 符文治疗药水 x10
 preset("mana5",   { { 33448, 5 } })                                     -- 符文法力药水 x5
 preset("ore5",    { { 36909, 5 } })                                     -- 钴矿石 x5
 preset("life2",   { { 37704, 2 } })                                     -- 生命结晶 x2
 preset("gold1",   nil, 10000)                                           -- 1 金
 preset("gold5",   nil, 50000)                                           -- 5 金
 preset("gold10",  nil, 100000)                                          -- 10 金
+preset("gold20",  nil, 200000)                                          -- 20 金
+preset("combo",   { { 33470, 5 }, { 33447, 2 } }, 50000)                -- 布 + 药 + 钱
 
 --==============================================================================
 --  ⑤ 配置：播报文本 与 管理员权限
@@ -331,8 +339,8 @@ end
 --
 --     题库与奖励预设**只以数据库为准**：脚本加载时检测表不存在就建库建表，
 --     并在题库为空时把内置题库导入一次（之后改题一律走面板或模板导入，不用改 lua 文件）。
---     TriviaReward_conf.lua 只提供"首次建库时的默认设置"，不再存放题目数据。
---     数据库不可用时才会退回 内置题库 + 文件配置，保证活动不会因为数据库问题中断。
+--     设置同理：表里的 trivia_reward_settings 那一行就是全部配置，改它请用面板。
+--     数据库不可用时才会退回 内置题库 + Config.Questions，保证活动不会因为数据库问题中断。
 --==============================================================================
 local DB = { available = false, tables = {}, lastError = "", checked = false }
 TR.db = DB
@@ -373,6 +381,16 @@ local SETTING_FIELDS = {
     { "mail_body",               "mailBody",               "string" },
     { "schedule_enabled",        "scheduleEnabled",        "bool" },
     { "schedule_windows",        "scheduleWindows",        "csvtext" },
+    -- 以下 9 列是 TriviaReward_conf.lua 退休时搬进数据库的（面板「设置」页可改）
+    { "debug_log",               "debug",                  "bool" },
+    { "idle_retry_seconds",      "idleRetrySeconds",       "int" },
+    { "resume_delay_seconds",    "resumeDelaySeconds",     "int" },
+    { "allow_loose_letter",      "allowLooseLetter",       "bool" },
+    { "ignore_gms",              "ignoreGMs",              "bool" },
+    { "gm_rank_exempt",          "gmRankExempt",           "int" },
+    { "answer_hint",             "answerHint",             "string" },
+    { "broadcast_prefix",        "prefix",                 "string" },
+    { "win_prefix",              "winPrefix",              "string" },
 }
 
 -- 建表语句（面板靠表结构读写，加列时请同步 AGMP 的 Domain/Trivia 与视图）
@@ -414,6 +432,15 @@ local SCHEMA_SQL = {
         .. "`mail_body` TEXT NULL,"
         .. "`schedule_enabled` TINYINT NOT NULL DEFAULT 0,"
         .. "`schedule_windows` VARCHAR(255) NOT NULL DEFAULT '',"
+        .. "`debug_log` TINYINT NOT NULL DEFAULT 0,"
+        .. "`idle_retry_seconds` INT NOT NULL DEFAULT 5,"
+        .. "`resume_delay_seconds` INT NOT NULL DEFAULT 5,"
+        .. "`allow_loose_letter` TINYINT NOT NULL DEFAULT 1,"
+        .. "`ignore_gms` TINYINT NOT NULL DEFAULT 1,"
+        .. "`gm_rank_exempt` INT NOT NULL DEFAULT 3,"
+        .. "`answer_hint` VARCHAR(255) NOT NULL DEFAULT '',"
+        .. "`broadcast_prefix` VARCHAR(32) NOT NULL DEFAULT '|cff00ff00[答题]|r ',"
+        .. "`win_prefix` VARCHAR(32) NOT NULL DEFAULT '|cffffd200[答题]|r ',"
         .. "`updated_at` INT NOT NULL DEFAULT 0,"
         .. "PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;",
     "CREATE TABLE IF NOT EXISTS `%s`.`trivia_reward_questions` ("
@@ -633,7 +660,7 @@ local function sqlValueOf(key, sqlType)
         return sqlQuote(joinCsv(value))
     end
     if sqlType == "csvtext" then
-        -- 允许配置文件里写成数组：{ "08:00-09:00", "20:00-21:00" }
+        -- 允许写成数组：{ "08:00-09:00", "20:00-21:00" }
         if type(value) == "table" then
             value = table.concat(value, ";")
         end
@@ -698,7 +725,7 @@ end
 
 -- 建库建表（幂等）：库/表不存在就建，并补齐老版本缺的列。
 -- 只做结构，不写任何业务数据——默认设置的写入见 seedDefaults()，
--- 它必须在 TriviaReward_conf.lua 加载完之后才能跑（否则会把脚本默认值当成配置写进库）。
+-- 它要等所有脚本都加载完才能跑（否则会把脚本默认值当成配置写进库）。
 local seedQuestionsIfEmpty -- 前置声明：实现在"题目准备"一节（依赖 normalizeQuestion）
 
 local function ensureSchema()
@@ -738,12 +765,22 @@ local function ensureSchema()
     -- 定时启停（面板「运行状态」页的定时计划）
     ensureColumn("trivia_reward_settings", "schedule_enabled", "TINYINT NOT NULL DEFAULT 0")
     ensureColumn("trivia_reward_settings", "schedule_windows", "VARCHAR(255) NOT NULL DEFAULT ''")
+    -- TriviaReward_conf.lua 退休后搬进数据库的 9 项（面板「设置」页可改）
+    ensureColumn("trivia_reward_settings", "debug_log", "TINYINT NOT NULL DEFAULT 0")
+    ensureColumn("trivia_reward_settings", "idle_retry_seconds", "INT NOT NULL DEFAULT 5")
+    ensureColumn("trivia_reward_settings", "resume_delay_seconds", "INT NOT NULL DEFAULT 5")
+    ensureColumn("trivia_reward_settings", "allow_loose_letter", "TINYINT NOT NULL DEFAULT 1")
+    ensureColumn("trivia_reward_settings", "ignore_gms", "TINYINT NOT NULL DEFAULT 1")
+    ensureColumn("trivia_reward_settings", "gm_rank_exempt", "INT NOT NULL DEFAULT 3")
+    ensureColumn("trivia_reward_settings", "answer_hint", "VARCHAR(255) NOT NULL DEFAULT ''")
+    ensureColumn("trivia_reward_settings", "broadcast_prefix", "VARCHAR(32) NOT NULL DEFAULT '|cff00ff00[答题]|r '")
+    ensureColumn("trivia_reward_settings", "win_prefix", "VARCHAR(32) NOT NULL DEFAULT '|cffffd200[答题]|r '")
 
     return true
 end
 
 -- 首次写入业务数据：设置行 / 奖励预设 / 种子题库（都只在表为空时写一次）。
--- 必须在 TriviaReward_conf.lua 加载完成后调用（脚本加载时 conf 可能还没加载）。
+-- 必须在脚本加载完成后调用（放到 tick 里，保证所有脚本都已加载）。
 local function seedDefaults()
     if not DB.available then
         return false
@@ -1133,7 +1170,7 @@ function seedQuestionsIfEmpty()
     return seeded
 end
 
--- 把所有来源汇总成最终题库（第一次使用时执行，保证配置文件已经加载完）
+-- 把所有来源汇总成最终题库（第一次使用时执行，保证所有脚本都已加载完）
 local function prepareQuestions()
     if TR.prepared then
         return
@@ -1233,7 +1270,7 @@ local function buildAnswerHint(q)
     if cfg.answerWhisper then places[#places + 1] = "悄悄话(/w)" end
 
     if #places == 0 then
-        return "（当前没有开启任何作答频道，请在 TriviaReward_conf.lua 里开启 answerSay / answerChannelIds）"
+        return "（当前没有开启任何作答频道，请在面板「聊天答题 → 设置」里开启 answerSay / answerChannelIds）"
     end
 
     local hint = "在 " .. table.concat(places, " 或 ") .. " 中输入 " .. labelsText(q)
@@ -2552,7 +2589,7 @@ local function onCommandImpl(event, player, command, chatHandler)
         if not round.active and (TR.nextRoundAt or 0) > now() + delay then
             TR.nextRoundAt = now() + delay
         end
-        replyTo(chatHandler, player, true, string.format("答题系统已开启，约 %d 秒后出下一题（重启服务器后以数据库/配置文件为准）。%s",
+        replyTo(chatHandler, player, true, string.format("答题系统已开启，约 %d 秒后出下一题（重启服务器后以数据库里的开关为准）。%s",
             delay, scheduleHint()))
         return false
     end
@@ -2562,7 +2599,7 @@ local function onCommandImpl(event, player, command, chatHandler)
         if round.active then
             finishRound(nil, "stopped")
         end
-        replyTo(chatHandler, player, true, "答题系统已关闭（重启服务器后以数据库/配置文件为准）。" .. scheduleHint())
+        replyTo(chatHandler, player, true, "答题系统已关闭（重启服务器后以数据库里的开关为准）。" .. scheduleHint())
         return false
     end
 
@@ -2692,8 +2729,8 @@ RegisterPlayerEvent(PLAYER_EVENT_ON_COMMAND, onCommand)
 RegisterPlayerEvent(PLAYER_EVENT_ON_LOGIN, onLogin)
 
 -- 数据表在脚本加载完成后立刻准备：第一个 tick（约 1 秒后）里建库建表并写入首次默认值。
--- 放到 tick 里而不是文件末尾，是为了确保 TriviaReward_conf.lua 已经加载完，
--- 否则会把脚本内置默认值（而不是你在 conf 里写的值）当成首次配置写进数据库。
+-- 放到 tick 里而不是文件末尾，是为了确保所有脚本都已加载完，
+-- 否则会把脚本内置默认值当成首次配置写进数据库。
 TR.pendingDbBootstrap = true
 
 -- 定时器无论开关都创建，这样 .trivia enable / disable 才能即时生效
