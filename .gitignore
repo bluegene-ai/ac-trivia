@@ -1,0 +1,11 @@
+# 测试运行产物（不要提交）
+tests/payload.json
+tests/db_snapshot.lua
+tests/schema.sql
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
