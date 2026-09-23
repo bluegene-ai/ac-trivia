@@ -1102,6 +1102,92 @@ check(TR.Config.intervalSeconds == 900, "数据库不可用时用内置默认 in
 check(#bank() == 37, "数据库不可用时退回内置题库 37 题（实际 " .. #bank() .. "）")
 db.failQueries = false
 
+print("== 21. 未出题原因（面板状态卡 / .trivia status / ALE 日志）==")
+
+-- 回到"数据库题库 + 系统开启"的干净状态
+TR.Config.enabled = true
+TR.paused = false
+TR.retryReason = nil
+cmd("trivia stop")
+cmd("trivia reload")
+TR.Config.minPlayersOnline = 1
+TR.Config.idleRetrySeconds = 5
+
+-- 21.1 在线人数不足（原来面板只会显示"空闲（下一题约 N 秒后）"，看不出原因）
+local realPlayerCount = GetPlayerCount
+GetPlayerCount = function() return 0 end
+TR.nextRoundAt = fakeTime
+local logsBeforePlayers = #logs
+tick()
+check(TR.waitReason == "players", "在线人数不足 → wait_reason=players", TR.waitReason)
+check(TR.waitReasonText:find("在线人数不足", 1, true) ~= nil, "原因文本说明人数不足", TR.waitReasonText)
+check(logHas("未出题原因（players）"), "原因变化时写一条 ALE 日志")
+check(TR.nextRoundAt - fakeTime == 5, "人数不足时按 idleRetrySeconds(5) 重试", TR.nextRoundAt - fakeTime)
+
+-- 21.2 5 秒重试窗口内保持同一原因、且不重复写日志（否则每 5 秒刷屏）
+local logsAfterPlayers = #logs
+fakeTime = fakeTime + 1
+tick()
+check(TR.waitReason == "players", "重试窗口内原因保持 players（不会闪成 interval）", TR.waitReason)
+check(#logs == logsAfterPlayers, "同一原因持续时不重复写日志", #logs - logsAfterPlayers)
+
+-- 21.3 人数恢复 → 出题并清空原因
+GetPlayerCount = realPlayerCount
+fakeTime = fakeTime + 4
+tick()
+check(TR.round.active == true, "人数恢复后立即出题")
+check(TR.waitReason == "" and TR.waitReasonText == "", "出题后未出题原因清空", TR.waitReason)
+cmd("trivia stop")
+tick()
+check(TR.waitReason == "interval", "本题结束后 → wait_reason=interval", TR.waitReason)
+check(TR.waitReasonText:find("等待出题间隔", 1, true) ~= nil, "原因文本说明在等出题间隔（保持静态，不随倒计时每秒变）", TR.waitReasonText)
+-- 倒计时变化不能反复写日志（否则每秒一行刷爆 Server.log）
+local logsAfterInterval = #logs
+fakeTime = fakeTime + 1
+tick()
+fakeTime = fakeTime + 1
+tick()
+check(#logs == logsAfterInterval, "倒计时推进不重复写日志", #logs - logsAfterInterval)
+
+-- 21.4 暂停
+cmd("trivia pause")
+tick()
+check(TR.waitReason == "paused", "暂停 → wait_reason=paused", TR.waitReason)
+cmd("trivia resume")
+cmd("trivia stop")
+tick()
+
+-- 21.5 手动关闭（要与"不在计划时段"区分开）
+cmd("trivia disable")
+tick()
+check(TR.waitReason == "disabled", "手动关闭 → wait_reason=disabled", TR.waitReason)
+cmd("trivia enable")
+cmd("trivia stop")
+tick()
+
+-- 21.6 出题真的失败时，把失败原因带出来（题库为空）
+local savedBank = TR.ActiveQuestions
+TR.ActiveQuestions = {}
+TR.nextRoundAt = fakeTime
+tick()
+check(TR.waitReason == "error", "题库为空 → wait_reason=error", TR.waitReason)
+check(TR.waitReasonText:find("题库为空", 1, true) ~= nil, "原因文本带出题失败原因", TR.waitReasonText)
+TR.ActiveQuestions = savedBank
+
+-- 21.7 JSON 与 .trivia status 都要输出原因，面板才显示得出来
+cmd("trivia reload")
+TR.Config.enabled = true
+TR.retryReason = nil
+TR.nextRoundAt = fakeTime + 600
+tick()
+local hWhy = cmd("trivia api")
+local whyPayload = (hWhy.sent[1] or ""):gsub("^%[AGMP_OK%]%s*", "")
+check(whyPayload:find('"wait_reason":"interval"', 1, true) ~= nil, "JSON 带 wait_reason（面板状态卡用）")
+check(whyPayload:find('"wait_reason_text":"等待出题间隔', 1, true) ~= nil, "JSON 带可读的 wait_reason_text")
+check(whyPayload:find('"min_players_online":', 1, true) ~= nil, "JSON 带 min_players_online")
+local hWhyStatus = cmd("trivia status")
+check(((hWhyStatus.sent[1] or ""):find("等待出题间隔", 1, true)) ~= nil, ".trivia status 文本里也带原因")
+
 print("")
 print(string.format("[%s] 结果: %d 通过, %d 失败", ORDER, pass, fail))
 if fail > 0 then os.exit(1) end

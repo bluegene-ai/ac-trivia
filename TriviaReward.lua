@@ -32,7 +32,7 @@
 --         .trivia reload         重新从数据库读取设置/题库/奖励预设
 --         .trivia schedule       查看定时启停计划（每天的时间段）与下一次开关时间
 --         .trivia api            输出单行 JSON 状态（AGMP 面板用）
---         .trivia status         查看运行状态（题库数、答题频道、下一题倒计时、定时计划）
+--         .trivia status         查看运行状态（题库数、答题频道、下一题倒计时、定时计划、未出题原因）
 --         .trivia stats          查看本次开启以来的答对排行
 --         .trivia chanscan       开始/停止频道扫描：把频道发言的频道 ID 打到 ALE 日志并私聊你，
 --                                用来确认"世界频道/综合频道"这类 ID（自定义频道是负数）
@@ -1613,6 +1613,12 @@ TR.bag = TR.bag or {}
 TR.stats = TR.stats or {}
 TR.nextRoundAt = TR.nextRoundAt or 0
 TR.paused = TR.paused or false
+-- 空闲原因：面板、.trivia status 与 ALE 日志靠它说明"现在为什么没出题"。
+-- 在此之前「在线人数不足 / 题库为空 / 已暂停 / 不在计划时段」在面板上长得一模一样
+-- （只有一句"空闲（下一题约 N 秒后）"），出了问题只能人工逐项排查。
+TR.waitReason = TR.waitReason or ""        -- 机器可读的原因键：interval/players/error/disabled/paused/scheduled
+TR.waitReasonText = TR.waitReasonText or "" -- 给面板与指令看的中文说明
+TR.retryReason = TR.retryReason or nil     -- 5 秒级重试期间要沿用展示的原因
 
 local function pickQuestion(optIndex)
     local bank = TR.ActiveQuestions or {}
@@ -2266,6 +2272,27 @@ local function applySchedule(t)
 end
 
 --================================================================= 定时器
+
+-- 无条件的运维日志，但只在原因**变化**时打一行，否则 5 秒级的重试会把 ALE 日志刷爆。
+-- 用 PrintError 而不是 PrintInfo：ALE 的 INFO 级输出在本服配置下不会落到任何日志文件
+-- （实测 Server.log / Errors.log 都收不到 PrintInfo，PrintError 会进 Server.log），
+-- 而 AGMP 面板的「日志」页读的正是 Server.log —— 用 INFO 等于这条原因没人看得见。
+local function setWaitReason(key, text)
+    key = key or ""
+    text = text or ""
+    local keyChanged = TR.waitReason ~= key
+    if not keyChanged and TR.waitReasonText == text then
+        return
+    end
+    TR.waitReason = key
+    TR.waitReasonText = text
+    -- 只在"原因种类"变化时写日志：文本可能带倒计时之类的动态内容，不能拿文本判重
+    -- （否则每秒一行，把 Server.log 刷爆）
+    if keyChanged and key ~= "" then
+        PrintError(string.format("[答题] 未出题原因（%s）：%s", key, text))
+    end
+end
+
 local function tickBody()
     local cfg = TR.Config
 
@@ -2280,15 +2307,27 @@ local function tickBody()
     end
 
     local t = now()
+    -- 重试间隔至少 1 秒，避免库里被写成 0 时变成每秒空转
+    local retrySeconds = tonumber(cfg.idleRetrySeconds) or 5
+    if retrySeconds < 1 then
+        retrySeconds = 1
+    end
 
     -- 定时计划先于开关判定：它自己会改写 cfg.enabled
     applySchedule(t)
 
     if not cfg.enabled then
+        -- 区分"计划时段外"与"管理员手动关闭"，前者不该被当成故障
+        if cfg.scheduleEnabled == true and TR.scheduleInfo ~= nil and TR.scheduleInfo.active == false then
+            setWaitReason("scheduled", "不在定时计划的时间段内（.trivia schedule 可看下次开启时间）")
+        else
+            setWaitReason("disabled", "答题系统已关闭（.trivia enable 可打开）")
+        end
         return
     end
 
     if round.active then
+        setWaitReason("", "")
         if t >= round.deadlineAt then
             finishRound(nil, "timeout")
         elseif cfg.remindEverySeconds > 0 and (t - round.lastRemindAt) >= cfg.remindEverySeconds then
@@ -2299,21 +2338,44 @@ local function tickBody()
     end
 
     if TR.paused then
+        setWaitReason("paused", "已暂停自动出题（.trivia resume 可恢复）")
         return
     end
 
     if t < (TR.nextRoundAt or 0) then
+        local remain = TR.nextRoundAt - t
+        -- 5 秒级的重试期间沿用上次的原因，否则会在"间隔中"和"人数不足"之间每 5 秒来回跳
+        if TR.retryReason ~= nil and remain <= retrySeconds then
+            setWaitReason(TR.retryReason.key, TR.retryReason.text)
+        else
+            -- 文本保持静态：倒计时由面板的「下一题」列与 JSON 的 next_in 展示，
+            -- 写进文本只会让它每秒都变（进而每秒写一行日志）
+            setWaitReason("interval", "等待出题间隔（下一题倒计时见「下一题」）")
+        end
         return
     end
+
+    TR.retryReason = nil
 
     if GetPlayerCount() < cfg.minPlayersOnline then
-        TR.nextRoundAt = t + cfg.idleRetrySeconds
+        TR.nextRoundAt = t + retrySeconds
+        TR.retryReason = {
+            key = "players",
+            text = string.format("在线人数不足（当前 %d 人，需要 %d 人；面板「最少在线人数」可调）",
+                GetPlayerCount(), tonumber(cfg.minPlayersOnline) or 0),
+        }
+        setWaitReason(TR.retryReason.key, TR.retryReason.text)
         return
     end
 
-    local ok = startRound(nil, false)
-    if not ok then
-        TR.nextRoundAt = t + cfg.idleRetrySeconds
+    local ok, err = startRound(nil, false)
+    if ok then
+        -- 同一 tick 内就清掉原因：否则面板/日志会残留上一次的"未出题原因"直到下一次 tick
+        setWaitReason("", "")
+    else
+        TR.nextRoundAt = t + retrySeconds
+        TR.retryReason = { key = "error", text = "出题失败：" .. tostring(err) }
+        setWaitReason(TR.retryReason.key, TR.retryReason.text)
     end
 end
 
@@ -2466,6 +2528,13 @@ local function statusJson()
         schedParts[#schedParts + 1] = schedList[i].text
     end
 
+    -- 有题在跑时不存在"未出题原因"：tick 之间 TR.waitReason 可能还残留上一次的值
+    local waitReason = TR.waitReason or ""
+    local waitReasonText = TR.waitReasonText or ""
+    if round.active then
+        waitReason, waitReasonText = "", ""
+    end
+
     local parts = {
         '"ok":true',
         '"state":' .. jsonString(state),
@@ -2478,6 +2547,11 @@ local function statusJson()
         '"answer_text":' .. jsonString(q and q.options[q.correct] or ""),
         '"remaining":' .. tostring(round.active and math.max(0, round.deadlineAt - t) or 0),
         '"next_in":' .. tostring((not round.active) and math.max(0, (TR.nextRoundAt or 0) - t) or 0),
+        -- 空闲原因：面板状态卡直接显示，避免"空闲（下一题约 N 秒后）"这种看不出所以然的等待
+        '"wait_reason":' .. jsonString(waitReason),
+        '"wait_reason_text":' .. jsonString(waitReasonText),
+        '"min_players_online":' .. tostring(tonumber(cfg.minPlayersOnline) or 0),
+        '"idle_retry_seconds":' .. tostring(tonumber(cfg.idleRetrySeconds) or 0),
         '"schedule_enabled":' .. tostring(schedEnabled),
         '"schedule_active":' .. tostring(schedActive),
         '"schedule_valid":' .. tostring(schedEnabled and #schedList > 0),
@@ -2675,12 +2749,17 @@ local function onCommandImpl(event, player, command, chatHandler)
         local state
         if not cfg.enabled then
             state = "已关闭"
+            if TR.waitReasonText ~= "" then
+                state = state .. "（" .. TR.waitReasonText .. "）"
+            end
         elseif TR.paused then
             state = "已暂停"
         elseif round.active then
             state = string.format("进行中（第 %d 题，剩余 %d 秒）", round.questionNo, math.max(0, round.deadlineAt - now()))
         else
-            state = string.format("空闲（下一题约 %s后）", formatDuration(math.max(0, (TR.nextRoundAt or 0) - now())))
+            local remainText = formatDuration(math.max(0, (TR.nextRoundAt or 0) - now()))
+            local why = (TR.waitReason ~= "" and TR.waitReasonText ~= "") and ("，" .. TR.waitReasonText) or ""
+            state = string.format("空闲（下一题约 %s后%s）", remainText, why)
         end
         replyTo(chatHandler, player, true, string.format(
             "状态：%s；题库：%d 题（内置 %d + 自定义 %d）；作答来源：%s；已出题：%d 次；在线：%d 人；间隔：%d 秒/题，作答：%d 秒。%s",
