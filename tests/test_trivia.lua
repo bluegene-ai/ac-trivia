@@ -117,6 +117,30 @@ local function splitSqlList(text)
 end
 
 local function applyWrite(sql)
+    -- UPDATE `db`.`table` SET `col` = v, ... WHERE `id` = 1
+    -- 设置回写（暂停/开关持久化）走的是这条路径，必须模拟，否则"重启后保持"测不出来。
+    -- 这些 UPDATE 只写数字/字符串字面量，所以按逗号切分是安全的。
+    local updTable, assignments = sql:match("^%s*UPDATE%s+`[^`]+`%.`([^`]+)`%s+SET%s+(.-)%s+WHERE")
+    if updTable ~= nil then
+        local rows = dbTable(updTable)
+        local target = nil
+        for i = 1, #rows do
+            if tonumber(rows[i].id) == 1 then target = rows[i] end
+        end
+        if target == nil and #rows > 0 then target = rows[1] end
+        if target ~= nil then
+            for col, raw in assignments:gmatch("`([^`]+)`%s*=%s*([^,]+)") do
+                raw = raw:gsub("^%s+", ""):gsub("%s+$", "")
+                if raw:match("^-?%d+$") then
+                    target[col] = tonumber(raw)
+                else
+                    target[col] = (raw:gsub("^'(.*)'$", "%1"))
+                end
+            end
+        end
+        return
+    end
+
     if sql:match("^%s*INSERT") == nil then
         return
     end
@@ -322,6 +346,10 @@ check(TR.RewardPresets.gold20 ~= nil and TR.RewardPresets.gold20.money == 200000
 check(TR.RewardPresets.heal10 ~= nil and TR.RewardPresets.combo ~= nil, "内置预设 heal10 / combo（原 conf 自定义）")
 check(TR.RewardPresets.cloth5 ~= nil and TR.RewardPresets.cloth5.items[1][1] == 33470, "内置预设 cloth5 仍在")
 check(#TR.Questions == 0, "脚本不再存放题目数据（题库在数据库里）", #TR.Questions)
+-- 「默认暂停」：不再重启就自动出题。总开关保持 true（系统在线、单题能跑），
+-- 自动出题由 paused 单独控制。
+check(TR.Config.paused == true, "内置默认 paused = true（默认暂停自动出题）", tostring(TR.Config.paused))
+check(TR.Config.enabled == true, "内置默认 enabled = true（总开关仍开，管的是系统在不在线）")
 
 print("== 3. 加载时自动建表 + 首次导入种子题库 ==")
 -- 脚本把建表/种子导入放到第一个 tick 里做（保证所有脚本都已加载），
@@ -350,6 +378,10 @@ check(sortOrders[1] and sortOrders[2] and sortOrders[#db.tables.trivia_reward_qu
 check(db.tables.trivia_reward_settings[1].answer_channel_ids == "综合",
     "默认设置写入的是脚本内置默认值：answer_channel_ids=综合",
     tostring(db.tables.trivia_reward_settings[1].answer_channel_ids))
+-- 默认暂停必须也落到库里：只改脚本内存默认值是不够的——服务器重启后设置是从这张表读的
+check(tonumber(db.tables.trivia_reward_settings[1].paused) == 1,
+    "默认设置行含 paused=1（重启后不会自动出题）",
+    tostring(db.tables.trivia_reward_settings[1].paused))
 
 -- 原 conf 专属的 9 项现在都写进默认设置行（面板可改）
 local seededSettings = db.tables.trivia_reward_settings[1]
@@ -785,8 +817,81 @@ check(logHas("25:00-26:00"), "非法时间段会写日志指出具体是哪一�
 TR.Config.scheduleEnabled = false
 TR.Config.scheduleWindows = ""
 TR.scheduleActive = nil
-TR.Config.enabled = true
+-- 走真实的 .trivia enable 而不是只改内存：14c 里"离开时间段把系统关掉"是会落库的真实行为，
+-- 后面几节要的是"系统在跑"，所以库里的 enabled / paused 也必须一起复位，
+-- 否则接下来的 cmd("trivia reload") 会从库里读回关闭状态，后面的用例全部起不来。
+cmd("trivia enable")
 TR.Config.intervalSeconds = 900
+
+print("== 14d. 默认暂停：重启不会自动出题 + 暂停状态跨重启保持 ==")
+
+-- 模拟"服务器刚启动"：设置从库里读出来（enabled=1, paused=1），没有定时计划。
+-- 这正是用户报的场景——以前这里会直接开始出题发奖励。
+db.tables.trivia_reward_settings[1].enabled = 1
+db.tables.trivia_reward_settings[1].paused = 1
+TR.Config.scheduleEnabled = false
+TR.Config.scheduleWindows = ""
+TR.scheduleActive = nil
+TR.prepared = nil
+TR.db.checked = false
+cmd("trivia stop")
+cmd("trivia reload")
+check(TR.paused == true, "库里 paused=1 → 载入后 TR.paused=true")
+TR.nextRoundAt = fakeTime            -- 就算"下一题时间已到"也不该出题
+local beforePause = TR.roundCounter
+logs = {}
+tick()
+check(TR.round.active == false, "默认暂停下 tick 不会出题")
+check(TR.roundCounter == beforePause, "默认暂停下不会消耗题目（没发奖励）")
+check(TR.waitReason == "paused", "默认暂停时 wait_reason=paused", TR.waitReason)
+
+-- 手动恢复 → 立刻可以出题，并且"恢复"必须落库（否则重启又回到暂停）
+local resumeCmd = cmd("trivia resume")
+check(TR.paused == false, ".trivia resume 取消暂停")
+check(tonumber(db.tables.trivia_reward_settings[1].paused) == 0, ".trivia resume 把 paused=0 写回数据库")
+check(resumeCmd.sent[1] ~= nil, ".trivia resume 有回复")
+TR.nextRoundAt = fakeTime
+tick()
+check(TR.round.active == true, "恢复后到点就出题")
+cmd("trivia stop")
+
+-- 再暂停 → 也要落库；然后 reload（≈服务器重启）必须仍然是暂停
+cmd("trivia pause")
+check(TR.paused == true, ".trivia pause 进入暂停")
+check(tonumber(db.tables.trivia_reward_settings[1].paused) == 1, ".trivia pause 把 paused=1 写回数据库")
+TR.prepared = nil
+TR.db.checked = false
+cmd("trivia reload")
+check(TR.paused == true, "重启（reload）后仍然是暂停状态，不会自动出题")
+TR.nextRoundAt = fakeTime
+tick()
+check(TR.round.active == false, "重启后即便到点也不出题")
+
+-- 定时计划必须能把"默认暂停"打开：这是"到点自动开启"的关键路径
+TR.Config.scheduleEnabled = true
+TR.Config.scheduleWindows = "08:00-09:00"
+TR.scheduleActive = nil
+TR.paused = true
+TR.Config.enabled = true
+db.tables.trivia_reward_settings[1].paused = 1
+fakeTime = tsAt(nil, 8, 30)
+cmd("trivia stop")
+logs = {}
+tick()
+check(TR.paused == false, "进入时间段 → 定时计划解除默认暂停")
+check(TR.Config.enabled == true, "进入时间段 → 系统保持开启")
+check(tonumber(db.tables.trivia_reward_settings[1].paused) == 0, "计划开启的结果也落库（paused=0）")
+TR.nextRoundAt = fakeTime
+tick()
+check(TR.round.active == true, "计划开启后按 resumeDelay 出题")
+
+-- 复位
+cmd("trivia stop")
+TR.Config.scheduleEnabled = false
+TR.Config.scheduleWindows = ""
+TR.scheduleActive = nil
+TR.paused = false
+TR.nextRoundAt = 0
 
 print("== 15. 种子开关 / 空题库 ==")
 -- use_builtin_questions 现在表示"首次建库时是否导入内置种子题库"；
@@ -1106,10 +1211,12 @@ print("== 21. 未出题原因（面板状态卡 / .trivia status / ALE 日志）
 
 -- 回到"数据库题库 + 系统开启"的干净状态
 TR.Config.enabled = true
-TR.paused = false
 TR.retryReason = nil
 cmd("trivia stop")
 cmd("trivia reload")
+-- 注意顺序：reload 会从库里读设置（默认 paused=1），所以暂停标记要在 reload 之后再清。
+-- 这里用正式的 .trivia resume 指令，而不是直接改 TR.paused——顺带覆盖"恢复会落库"这条路径。
+cmd("trivia resume")
 TR.Config.minPlayersOnline = 1
 TR.Config.idleRetrySeconds = 5
 

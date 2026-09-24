@@ -60,7 +60,14 @@ local C = TR.Config
 --==============================================================================
 --  ① 配置：开启 / 关闭 与出题节奏
 --==============================================================================
+-- 【默认暂停】paused=true：服务器启动/重载后不会自动出题、不会自动发奖励。
+--   总开关 enabled 保持 true —— 它管的是"系统在不在线"（作答收不收、单题能不能跑），
+--   不是"要不要自动出题"；自动出题由 paused 单独控制。
+--   恢复出题：管理员 .trivia resume（面板「恢复自动出题」），或让下面的定时计划到点自动开启。
+--   想恢复"启动即开跑"的老行为：把 paused 改成 false。
+--   注意：库里有 trivia_reward_settings 那一行时以库为准（paused 已持久化，重启后保持）。
 setDefault(C, "enabled", true)                  -- 总开关：false = 完全不运行（也可用 .trivia disable 运行时关闭）
+setDefault(C, "paused", true)                   -- 默认暂停自动出题：true = 不自动出题，需 .trivia resume 手动恢复
 setDefault(C, "debug", false)                   -- true = 把每题开始/结束/频道扫描写进 ALE 日志（面板里可开关）
 setDefault(C, "firstDelaySeconds", 60)          -- 服务器启动（或 .reload ale）后多少秒出第一题
 setDefault(C, "intervalSeconds", 900)           -- 上一题结束到下一题开始之间的间隔（秒）
@@ -348,6 +355,7 @@ TR.db = DB
 -- 数据库列 → 配置键 的映射（面板表单与这里一一对应，两边改动要同步）
 local SETTING_FIELDS = {
     { "enabled",                 "enabled",                "bool" },
+    { "paused",                  "paused",                 "bool" },
     { "interval_seconds",        "intervalSeconds",        "int" },
     { "answer_seconds",          "answerSeconds",          "int" },
     { "remind_every_seconds",    "remindEverySeconds",     "int" },
@@ -399,6 +407,7 @@ local SCHEMA_SQL = {
     "CREATE TABLE IF NOT EXISTS `%s`.`trivia_reward_settings` ("
         .. "`id` TINYINT UNSIGNED NOT NULL DEFAULT 1,"
         .. "`enabled` TINYINT NOT NULL DEFAULT 1,"
+        .. "`paused` TINYINT NOT NULL DEFAULT 1,"
         .. "`interval_seconds` INT NOT NULL DEFAULT 900,"
         .. "`answer_seconds` INT NOT NULL DEFAULT 60,"
         .. "`remind_every_seconds` INT NOT NULL DEFAULT 30,"
@@ -765,6 +774,13 @@ local function ensureSchema()
     -- 定时启停（面板「运行状态」页的定时计划）
     ensureColumn("trivia_reward_settings", "schedule_enabled", "TINYINT NOT NULL DEFAULT 0")
     ensureColumn("trivia_reward_settings", "schedule_windows", "VARCHAR(255) NOT NULL DEFAULT ''")
+    -- 暂停状态持久化：让"暂停"能跨重启保持（默认 1 = 暂停，也就是服务器启动后不自动出题）
+    if ensureColumn("trivia_reward_settings", "paused", "TINYINT NOT NULL DEFAULT 1") then
+        -- 老版本没有这一列，ALTER 的 DEFAULT 1 会把已有的那一行也置成暂停——正是想要的效果，
+        -- 所以这里不需要额外的 UPDATE 去改写历史数据。
+        logInfo("trivia_reward_settings 已新增 paused 列并默认置 1：答题系统默认暂停，"
+            .. "不会在服务器重启后自动出题（用 .trivia resume / 面板「恢复自动出题」开启）。")
+    end
     -- TriviaReward_conf.lua 退休后搬进数据库的 9 项（面板「设置」页可改）
     ensureColumn("trivia_reward_settings", "debug_log", "TINYINT NOT NULL DEFAULT 0")
     ensureColumn("trivia_reward_settings", "idle_retry_seconds", "INT NOT NULL DEFAULT 5")
@@ -851,6 +867,61 @@ local function loadSettingsFromDb()
 
     logInfo("已从数据库载入 %d 项设置。", applied)
     return applied
+end
+
+-- 把若干设置项从 TR.Config 写回数据库（列名与类型按 SETTING_FIELDS）。
+-- 用途：让"暂停 / 开启"这种运行时状态跨重启保持——面板页脚与 .trivia enable 的提示语
+-- 一直写着"重启后以数据库里的开关为准"，这里就是把运行时的改动真正落到库里。
+-- keys 传配置键（如 "enabled"、"paused"），只更新这几列，其余列不动。
+local function persistSettings(keys)
+    if not DB.available or TR.Config.useDatabase == false then
+        return false
+    end
+
+    local want = {}
+    for i = 1, #keys do
+        want[keys[i]] = true
+    end
+
+    -- paused 的运行时真值是 TR.paused（cfg.paused 只是它在库里的副本）。
+    -- 这里兜一道，避免调用方只改了 TR.paused，却把过期的 cfg.paused 写回库里。
+    if want["paused"] then
+        TR.Config.paused = TR.paused == true
+    end
+
+    local sets = {}
+    for i = 1, #SETTING_FIELDS do
+        local field = SETTING_FIELDS[i]
+        if want[field[2]] then
+            sets[#sets + 1] = string.format("`%s` = %s", field[1], sqlValueOf(field[2], field[3]))
+        end
+    end
+    if #sets == 0 then
+        return false
+    end
+
+    sets[#sets + 1] = string.format("`updated_at` = %d", now())
+    dbExec(string.format("UPDATE `%s`.`trivia_reward_settings` SET %s WHERE `id` = 1;",
+        dbName(), table.concat(sets, ", ")))
+    return true
+end
+
+-- 暂停状态以配置为准：数据库载入设置后调用，把 cfg.paused 同步到运行时 TR.paused。
+-- TR.paused 是真正被 tick 判定的那个值，cfg.paused 只是它在库里的持久化副本。
+local function syncPausedFromConfig()
+    local cfg = TR.Config
+    if cfg.paused ~= nil then
+        TR.paused = cfg.paused == true
+    end
+    return TR.paused
+end
+
+-- 统一改暂停状态：同时更新运行时与数据库，避免"改了但重启就丢"。
+local function setPaused(paused)
+    TR.paused = paused == true
+    TR.Config.paused = TR.paused
+    persistSettings({ "paused" })
+    return TR.paused
 end
 
 local function loadPresetsFromDb()
@@ -1204,6 +1275,8 @@ local function prepareQuestions()
     if cfg.useDatabase ~= false and cfg.dbName then
         if ensureSchema() then
             loadSettingsFromDb()
+            -- 暂停状态以库里的值为准（跨重启保持），载入后立刻同步到运行时
+            syncPausedFromConfig()
             seedDefaults()
             loadPresetsFromDb()
             TR.DbQuestions = loadQuestionsFromDb()
@@ -1612,7 +1685,9 @@ TR.roundCounter = TR.roundCounter or 0
 TR.bag = TR.bag or {}
 TR.stats = TR.stats or {}
 TR.nextRoundAt = TR.nextRoundAt or 0
-TR.paused = TR.paused or false
+-- 默认暂停：TR.Config.paused 的脚本默认值是 true，所以服务器启动后不会自动出题；
+-- 数据库载入设置后会由 syncPausedFromConfig() 用库里的值覆盖（跨重启保持）。
+TR.paused = TR.paused == true or (TR.paused == nil and TR.Config.paused == true)
 -- 空闲原因：面板、.trivia status 与 ALE 日志靠它说明"现在为什么没出题"。
 -- 在此之前「在线人数不足 / 题库为空 / 已暂停 / 不在计划时段」在面板上长得一模一样
 -- （只有一句"空闲（下一题约 N 秒后）"），出了问题只能人工逐项排查。
@@ -2241,21 +2316,32 @@ local function applySchedule(t)
     }
 
     if active then
-        if not cfg.enabled then
+        -- 定时计划优先于 .trivia enable / disable 与暂停：进入时间段就自动开始出题。
+        -- 这里必须同时看 paused：脚本的默认状态就是"暂停"，只判 enabled 的话
+        -- 默认暂停会把定时计划挡在门外，时间段到了也不会出题。
+        if (not cfg.enabled) or TR.paused then
+            local wasClosed = not cfg.enabled
             cfg.enabled = true
             TR.paused = false
+            -- 必须同时改 cfg.paused：persistSettings 是从 TR.Config 取值的，
+            -- 只改 TR.paused 会把旧的（暂停）值又写回库里。
+            cfg.paused = false
+            -- 落库：定时开启的结果要跨重启保持（否则重启后又回到暂停，白开一次）
+            persistSettings({ "enabled", "paused" })
             if not round.active and (TR.nextRoundAt or 0) > t + (tonumber(cfg.resumeDelaySeconds) or 5) then
                 TR.nextRoundAt = t + (tonumber(cfg.resumeDelaySeconds) or 5)
             end
             broadcast(string.format("%s答题活动已按定时计划开启（%s），祝你好运！", cfg.prefix, tostring(hit.text)))
             -- 定时计划一天只会翻转几次，属于运维事件：无条件写日志（不受 Config.debug 影响）
-            PrintInfo("[答题] 定时计划：进入 " .. tostring(hit.text) .. "，已自动开启答题。")
+            PrintInfo("[答题] 定时计划：进入 " .. tostring(hit.text) .. "，已自动开启答题"
+                .. (wasClosed and "。" or "（解除暂停）。"))
         end
         return
     end
 
     if cfg.enabled then
         cfg.enabled = false
+        persistSettings({ "enabled" })
         local hadRound = round.active
         if round.active then
             finishRound(nil, "scheduled")
@@ -2301,7 +2387,12 @@ local function tickBody()
         TR.pendingDbBootstrap = nil
         if cfg.useDatabase ~= false then
             if ensureSchema() then
+                -- 必须在这里读一次设置：否则重启后 cfg 还是脚本默认值，
+                -- 面板里配的 enabled / scheduleEnabled / paused 全都不生效
+                -- （定时计划也就永远不会在时间段自动开启）。
+                loadSettingsFromDb()
                 seedDefaults()
+                syncPausedFromConfig()
             end
         end
     end
@@ -2632,14 +2723,14 @@ local function onCommandImpl(event, player, command, chatHandler)
             replyTo(chatHandler, player, true, "自动出题已经是暂停状态（当前题目继续到结束）。")
             return false
         end
-        TR.paused = true
-        replyTo(chatHandler, player, true, "已暂停自动出题（当前题目继续到结束；用 .trivia resume 恢复）。")
+        setPaused(true)
+        replyTo(chatHandler, player, true, "已暂停自动出题（当前题目继续到结束；用 .trivia resume 恢复）。此状态已存入数据库，重启后依然暂停。")
         return false
     end
 
     if sub == "resume" or sub == "on" then
         local delay = tonumber(cfg.resumeDelaySeconds) or 5
-        TR.paused = false
+        setPaused(false)
         -- 无条件把下一题提前：否则"暂停→恢复"之后还要等完整个 intervalSeconds（默认 900 秒），
         -- 面板上看起来就是"恢复按钮点了没用"。
         if not round.active and (TR.nextRoundAt or 0) > now() + delay then
@@ -2659,7 +2750,8 @@ local function onCommandImpl(event, player, command, chatHandler)
     if sub == "enable" then
         local delay = tonumber(cfg.resumeDelaySeconds) or 5
         cfg.enabled = true
-        TR.paused = false
+        setPaused(false)   -- 已经顺带把 paused 落库
+        persistSettings({ "enabled" })
         if not round.active and (TR.nextRoundAt or 0) > now() + delay then
             TR.nextRoundAt = now() + delay
         end
@@ -2670,6 +2762,7 @@ local function onCommandImpl(event, player, command, chatHandler)
 
     if sub == "disable" then
         cfg.enabled = false
+        persistSettings({ "enabled" })
         if round.active then
             finishRound(nil, "stopped")
         end
@@ -2816,9 +2909,12 @@ TR.pendingDbBootstrap = true
 TR.nextRoundAt = now() + TR.Config.firstDelaySeconds
 startTicker()
 
-if TR.Config.enabled then
+-- 这里的判断只反映"脚本默认值"（数据库设置要等第一个 tick 才载入）：
+-- 默认 paused=true，所以正常情况下都会打印"默认暂停"这一条。
+if not TR.Config.enabled or TR.paused then
+    PrintInfo("[答题] 已加载，自动出题为「默认暂停」：服务器重启后不会自动出题，也不会自动发奖励。"
+        .. "用 .trivia resume（面板「恢复自动出题」）手动开启；若已配置定时计划，到点会自动开启。")
+else
     PrintInfo(string.format("[答题] 已加载，%d 秒后自动开始第一题（间隔 %d 秒/题，作答 %d 秒）。",
         TR.Config.firstDelaySeconds, TR.Config.intervalSeconds, TR.Config.answerSeconds))
-else
-    PrintInfo("[答题] Config.enabled = false，答题系统处于关闭状态（可用 .trivia enable 打开）。")
 end
